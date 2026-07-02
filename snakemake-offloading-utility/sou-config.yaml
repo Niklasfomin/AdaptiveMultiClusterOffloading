@@ -1,0 +1,25 @@
+clusters:
+  primary:
+    nodes:
+      - name: node1
+        cores: 32
+        mem_gb: 125
+        disk_gb: 1024
+      - name: node2
+        cores: 32
+        mem_gb: 125
+        disk_gb: 1024
+  secondary:
+    nodes:
+      - name: node3
+        cores: 32
+        mem_gb: 125
+        disk_gb: 1024
+      - name: node4
+        cores: 32
+        mem_gb: 125
+        disk_gb: 1024
+    prices:
+      vcpu_hour: 0.04656
+      mem_gb_hour: 0.00511
+      disk_gb_hour: 0.000132

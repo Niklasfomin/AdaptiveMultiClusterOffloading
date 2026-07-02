@@ -1,0 +1,6 @@
+*.egg-info
+dist
+.DS_Store
+misc
+.idea
+build

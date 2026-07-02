@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cluster Configuration",
+  "type": "object",
+  "properties": {
+    "clusters": {
+      "type": "object",
+      "properties": {
+        "primary": {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/node" },
+              "minItems": 1
+            }
+          },
+          "required": ["nodes"],
+          "additionalProperties": false
+        },
+        "secondary": {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/node" },
+              "minItems": 1
+            },
+            "prices": {
+              "type": "object",
+              "properties": {
+                "vcpu_hour": { "type": "number", "minimum": 0 },
+                "mem_gb_hour": { "type": "number", "minimum": 0 },
+                "disk_gb_hour": { "type": "number", "minimum": 0 }
+              },
+              "required": ["vcpu_hour", "mem_gb_hour", "disk_gb_hour"],
+              "additionalProperties": false
+            }
+          },
+          "required": ["nodes"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["primary", "secondary"],
+      "additionalProperties": false
+    }
+  },
+  "required": ["clusters"],
+  "additionalProperties": false,
+  "$defs": {
+    "node": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "cores": { "type": "integer", "minimum": 0 },
+        "mem_gb": { "type": "number", "minimum": 0 },
+        "disk_gb": { "type": "number", "minimum": 0 }
+      },
+      "required": ["name", "cores", "mem_gb", "disk_gb"],
+      "additionalProperties": false
+    }
+  }
+}

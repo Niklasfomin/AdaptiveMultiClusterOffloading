@@ -1,0 +1,38 @@
+# Python / packaging
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# macOS / editor noise
+.DS_Store
+._*
+
+NFS_OFFLOADER_DEBUG_NOTES.md
+
+# Generated plot images.
+/plots/**/*.pdf
+/plots/**/*.png
+
+# Snakemake / SOU runtime state
+.snakemake/
+.sou/
+logs/
+results/
+temp/
+
+# Downloaded workflow runs and datasets.
+# Keep only top-level workflow-run documentation under workflow-runs/.
+/workflow-runs/**
+!/workflow-runs/
+!/workflow-runs/LARGE_CATALOG_WORKFLOWS.md
+
+# Paper experiment outputs / training data are local data artifacts.
+/experimental-data/
+
+# Local storage roots used during FTP/NFS experiments.
+/ftp-root/
+/workflow-runs/ftp-root/

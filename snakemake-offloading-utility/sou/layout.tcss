@@ -1,0 +1,39 @@
+Screen {
+    align: center middle;
+}
+
+Button {
+   margin: 0 1 0 1;
+}
+
+Buttons {
+    max-width: 80;
+}
+
+Parameters {
+    max-width: 150;
+}
+
+ParameterLabels {
+    max-width: 150;
+}
+
+.vertical {
+    width: 1fr;
+}
+
+.heading {
+    width: 100%;
+    text-align: center;
+    background: white 10%;
+    margin: 1;
+}
+
+#prediction_log {
+    margin: 0 0 0 1;
+}
+
+#offloading_strategy_option_list {
+    height: 3;
+    margin: 0 0 0 1;
+}
