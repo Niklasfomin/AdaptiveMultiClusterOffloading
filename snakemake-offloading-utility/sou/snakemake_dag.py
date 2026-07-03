@@ -4,7 +4,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from sou.helpers import run_command, get_snakemake_params
+from sou.helpers import get_snakemake_params, run_command
 
 D3DAG_CACHE = ".sou/d3dag.json"
 

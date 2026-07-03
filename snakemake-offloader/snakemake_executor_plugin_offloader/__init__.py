@@ -1,26 +1,36 @@
 from dataclasses import dataclass, field
-from typing import List, Generator, Optional, AsyncGenerator
+from typing import AsyncGenerator, Generator, List, Optional
+
+from snakemake_executor_plugin_kubernetes import (
+    Executor as KubernetesExecutor,
+)
+from snakemake_executor_plugin_kubernetes import (
+    ExecutorSettings as KubernetesExecutorSettings,
+)
 from snakemake_interface_executor_plugins.executors.base import SubmittedJobInfo
 from snakemake_interface_executor_plugins.executors.remote import RemoteExecutor
-from snakemake_interface_executor_plugins.settings import (
-    ExecutorSettingsBase,
-    CommonSettings,
-)
-from snakemake_interface_executor_plugins.workflow import WorkflowExecutorInterface
-from snakemake_interface_executor_plugins.logging import LoggerExecutorInterface
-
 from snakemake_interface_executor_plugins.jobs import (
     JobExecutorInterface,
 )
-from snakemake_executor_plugin_kubernetes import (
-    Executor as KubernetesExecutor,
-    ExecutorSettings as KubernetesExecutorSettings,
+from snakemake_interface_executor_plugins.logging import LoggerExecutorInterface
+from snakemake_interface_executor_plugins.settings import (
+    CommonSettings,
+    ExecutorSettingsBase,
 )
+from snakemake_interface_executor_plugins.workflow import WorkflowExecutorInterface
 
-from snakemake_executor_plugin_openstack import (
-    Executor as OpenstackExecutor,
-    ExecutorSettings as OpenstackExecutorSettings,
-)
+try:
+    from snakemake_executor_plugin_openstack import (
+        Executor as OpenstackExecutor,
+    )
+    from snakemake_executor_plugin_openstack import (
+        ExecutorSettings as OpenstackExecutorSettings,
+    )
+except ImportError:
+    # OpenStack support is optional; only required when an 'openstack'
+    # compute environment is actually requested.
+    OpenstackExecutor = None
+    OpenstackExecutorSettings = None
 
 
 # Optional:
@@ -255,6 +265,11 @@ class Executor(RemoteExecutor):
                 )
             primary_comp_env = KubernetesExecutor(self.workflow, self.logger)
         elif primary_env_type == "openstack":
+            if OpenstackExecutor is None:
+                raise ValueError(
+                    "OpenStack compute environment requested, but the "
+                    "'snakemake-executor-plugin-openstack' package is not installed."
+                )
             primary_comp_env = OpenstackExecutor(self.workflow, self.logger)
         else:
             raise ValueError(
@@ -274,6 +289,11 @@ class Executor(RemoteExecutor):
                     )
                 secondary_comp_env = KubernetesExecutor(self.workflow, self.logger)
             elif secondary_env_type == "openstack":
+                if OpenstackExecutor is None:
+                    raise ValueError(
+                        "OpenStack compute environment requested, but the "
+                        "'snakemake-executor-plugin-openstack' package is not installed."
+                    )
                 secondary_comp_env = OpenstackExecutor(self.workflow, self.logger)
             else:
                 raise ValueError(

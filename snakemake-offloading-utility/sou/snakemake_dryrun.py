@@ -2,7 +2,7 @@ import logging
 import re
 from pathlib import Path
 
-from sou.helpers import get_snakemake_params, run_command, remove_storage_prefix
+from sou.helpers import get_snakemake_params, remove_storage_prefix, run_command
 
 DRYRUN_CACHE = ".sou/dryrun.txt"
 

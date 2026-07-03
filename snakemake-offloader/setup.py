@@ -13,6 +13,5 @@ setup(
         "snakemake-interface-common",
         "snakemake-interface-executor-plugins",
         "snakemake-executor-plugin-kubernetes",
-        "snakemake-executor-plugin-openstack",
     ],
 )

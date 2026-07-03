@@ -1,4 +1,0 @@
-*.egg-info
-dist
-.DS_Store
-misc/admin-openrc.sh
