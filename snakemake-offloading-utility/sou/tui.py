@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from textual.app import App, ComposeResult
-from textual.containers import Center, HorizontalGroup
+from textual.containers import Center, HorizontalGroup, VerticalGroup
 from textual.widgets import (
     Button,
     Footer,
@@ -13,6 +13,7 @@ from textual.widgets import (
     Input,
     Label,
     OptionList,
+    Placeholder,
     RichLog,
     Static,
 )
@@ -23,7 +24,13 @@ from sou.helpers import (
     run_command,
     set_snakemake_params,
 )
-from sou.scheduler import OffloadingStrategy
+from sou.scheduler import (
+    CostModel,
+    OffloadingStrategy,
+    ProfilingEnvironment,
+    ProfilingStrategy,
+    RuntimeEstimator,
+)
 
 
 class RichLogHandler(logging.Handler):
@@ -40,53 +47,113 @@ logger = logging.getLogger("sou")
 logger.setLevel(logging.DEBUG)
 
 
-class ParameterLabels(HorizontalGroup):
+class ParameterRow(HorizontalGroup):
+    def __init__(self, label: str, field, **kwargs):
+        super().__init__(**kwargs)
+        self.label = label
+        self.field = field
+
     def compose(self) -> ComposeResult:
-        yield Label(" Runs directory:", classes="vertical")
-        yield Label(" Correlation threshold:", classes="vertical")
-        yield Label("Deadline:", classes="vertical")
-        yield Label("Offloading strategy:", classes="vertical")
+        yield Label(self.label, classes="parameter_label")
+        yield self.field
 
 
-class Parameters(HorizontalGroup):
+# TODO: Add button for local and remote profiling
+# TODO: Add cost model for GKE and data tranmission costs
+# TODO: Add more options for model training
+class Parameters(VerticalGroup):
     def compose(self) -> ComposeResult:
-        yield Input(
-            placeholder="/path/to/runs-directory",
-            id="runs_dir_input",
-            classes="vertical",
+        yield ParameterRow(
+            "Profiling strategy:",
+            OptionList(
+                *[pm.value for pm in ProfilingStrategy],
+                id="profiling_strategy",
+                classes="parameter_field option_field",
+                compact=True,
+            ),
         )
-        yield Input(
-            placeholder="(default: 0.8)",
-            id="threshold_input",
-            classes="vertical",
-            type="number",
-            valid_empty=True,
+        yield ParameterRow(
+            "Profiling environment:",
+            OptionList(
+                *[pe.value for pe in ProfilingEnvironment],
+                id="profiling_environment",
+                classes="parameter_field option_field",
+                compact=True,
+            ),
         )
-        yield Input(
-            placeholder="(in minutes)",
-            id="deadline_input",
-            classes="vertical",
-            type="number",
-            valid_empty=True,
+        yield ParameterRow(
+            "Runtime estimator:",
+            OptionList(
+                *[e.value for e in RuntimeEstimator],
+                id="runtime_estimator",
+                classes="parameter_field option_field",
+                compact=True,
+            ),
         )
-        yield OptionList(
-            *[s.value for s in OffloadingStrategy],
-            id="offloading_strategy_option_list",
-            classes="vertical",
-            compact=True,
+        yield ParameterRow(
+            "Cost model:",
+            OptionList(
+                *[c.value for c in CostModel],
+                id="cost_model",
+                classes="parameter_field option_field",
+                compact=True,
+            ),
+        )
+        yield ParameterRow(
+            "Runs directory:",
+            Input(
+                placeholder="/path/to/runs-directory",
+                id="runs_dir_input",
+                classes="parameter_field",
+            ),
+        )
+        yield ParameterRow(
+            "Correlation threshold:",
+            Input(
+                placeholder="(default: 0.8)",
+                id="threshold_input",
+                classes="parameter_field",
+                type="number",
+                valid_empty=True,
+            ),
+        )
+        yield ParameterRow(
+            "Deadline:",
+            Input(
+                placeholder="(in minutes)",
+                id="deadline_input",
+                classes="parameter_field",
+                type="number",
+                valid_empty=True,
+            ),
+        )
+        yield ParameterRow(
+            "Offloading strategy:",
+            OptionList(
+                *[s.value for s in OffloadingStrategy],
+                id="offloading_strategy_option_list",
+                classes="parameter_field option_field",
+                compact=True,
+            ),
         )
 
 
 class Buttons(HorizontalGroup):
     def compose(self) -> ComposeResult:
         yield Button(
-            "Predict Makespan and Cost",
+            "Run Profiling",
+            id="profiling_button",
+            classes="vertical",
+            variant="success",
+        )
+        yield Button(
+            "Run Performance Estimations",
             id="predict_button",
             classes="vertical",
             variant="success",
         )
         yield Button(
-            "Execute Snakemake (Quit SOU)",
+            "Execute Workflow(Quit SOU)",
             id="execute_button",
             classes="vertical",
             variant="warning",
@@ -113,7 +180,6 @@ class SnakemakeOffloadingUtility(App):
         with Center():
             yield Static("Parameters", id="sou_parameters_static", classes="heading")
         with Center():
-            yield ParameterLabels()
             yield Parameters()
         with Center():
             yield Static("Actions", id="sou_actions_static", classes="heading")
@@ -153,6 +219,21 @@ class SnakemakeOffloadingUtility(App):
         deadline = self.query_one("#deadline_input", Input).value
         deadline_seconds = float(deadline) * 60 if deadline else None
 
+        profiling_environment_obj = self.query_one("#profiling_environment", OptionList)
+        profiling_environment = ProfilingEnvironment(
+            profiling_environment_obj.options[
+                profiling_environment_obj.highlighted
+            ].prompt
+        )
+        if profiling_environment in [
+            ProfilingEnvironment.LOCAL,
+            ProfilingEnvironment.REMOTE,
+        ]:
+            self.rich_log.write(
+                "[bold red]The selected profiling environment is not supported for this action[/bold red]"
+            )
+            return
+
         offloading_strategy_obj = self.query_one(
             "#offloading_strategy_option_list", OptionList
         )
@@ -172,7 +253,7 @@ class SnakemakeOffloadingUtility(App):
             )
             return
 
-        if event.button.id == "predict_button":
+        if event.button.id in {"profiling_button", "predict_button"}:
             # logs
             handler = RichLogHandler(self.rich_log)
             handler.setFormatter(
@@ -184,7 +265,11 @@ class SnakemakeOffloadingUtility(App):
 
             # predict
             await self.run_sou(
-                runs_dir, deadline_seconds, offloading_strategy, corr_threshold
+                runs_dir,
+                deadline_seconds,
+                offloading_strategy,
+                profiling_environment,
+                corr_threshold,
             )
             logger.removeHandler(handler)
         elif event.button.id == "execute_button":
@@ -209,6 +294,7 @@ class SnakemakeOffloadingUtility(App):
         runs_dir: str,
         deadline_seconds: int | None,
         offloading_strategy: OffloadingStrategy,
+        profiling_environment: ProfilingEnvironment,
         corr_threshold: float,
     ) -> None:
         loop = asyncio.get_running_loop()
@@ -219,6 +305,7 @@ class SnakemakeOffloadingUtility(App):
                 runs_dir,
                 deadline_seconds,
                 offloading_strategy,
+                profiling_environment,
                 corr_threshold,
             )
             if result:

@@ -11,9 +11,9 @@ from statistics import median
 
 from sou.helpers import (
     get_config,
-    setup_logging,
     get_initial_input_file_sizes,
     log_predictions,
+    setup_logging,
 )
 from sou.predictor import Predictor
 from sou.snakemake_dag import SnakemakeDag
@@ -80,6 +80,29 @@ class OffloadingStrategy(Enum):
     PRIMARY_OCCUPIED = "Primary cluster fully occupied"
     LONGEST_JOB_FIRST = "Longest job first"
     SMALLEST_INPUT_SIZE_FIRST = "Smallest input size first"
+
+
+class ProfilingStrategy(Enum):
+    NONE = "No profiling"
+    WORFLOW_TEST = "Workflow test profile"
+    SYSTEM_BENCHMARK = "System benchmark profile"
+
+
+class ProfilingEnvironment(Enum):
+    NONE = "No profiling"
+    LOCAL = "Profiling the scientist's PC"
+    REMOTE = "Profiling the one or multiple sites"
+
+
+class CostModel(Enum):
+    VM = "cloud vm pricing"
+    GKE = "cloud cluster pricing"
+    NETWORK_LATENCY = "cost incurring for data transfer between clusters"
+
+
+class RuntimeEstimator(Enum):
+    LINEAR_REGRESSION = "linear regression model for runtime estimation"
+    BAYESIAN_REGRESSION = "probabilistic model for runtime estimation"
 
 
 class Scheduler:
@@ -250,7 +273,7 @@ class Scheduler:
                         f"Selected next job to offload: {next_to_offload} ({self.dag.get_rule_by_jobid(next_to_offload)})"
                     )
                     logger.info(
-                        f"Offloading these jobs: {offloaded_jobs | {next_to_offload} }"
+                        f"Offloading these jobs: {offloaded_jobs | {next_to_offload}}"
                     )
                     latest_runtime_estimate, offloaded_jobs, deferred_jobs = (
                         self.simulate_workflow_run(
@@ -368,16 +391,24 @@ class Scheduler:
             if "runtime" in model_name:
                 median_setup_time = self.predictor.median_setup_times.get(rule)
                 if median_setup_time is None:
-                    logger.warning(f"No median setup time found for job id {jobid} ({rule})")
+                    logger.warning(
+                        f"No median setup time found for job id {jobid} ({rule})"
+                    )
                     predictions[jobid] = None
                     missing_jobids.append(jobid)
                     continue
                 predictions[jobid] = median_setup_time + prediction
             else:  # wall time
                 predictions[jobid] = prediction
-        fallback_prediction = median(
-            prediction for prediction in predictions.values() if prediction is not None
-        ) if any(prediction is not None for prediction in predictions.values()) else 0
+        fallback_prediction = (
+            median(
+                prediction
+                for prediction in predictions.values()
+                if prediction is not None
+            )
+            if any(prediction is not None for prediction in predictions.values())
+            else 0
+        )
         for jobid in missing_jobids:
             predictions[jobid] = fallback_prediction
             logger.warning(
@@ -445,6 +476,7 @@ def main(
     runs_dir: str,
     deadline: int | None = None,
     offloading_strategy: OffloadingStrategy = OffloadingStrategy.NONE,
+    profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
     corr_threshold: float = 0.8,
 ):
     setup_logging()
@@ -463,17 +495,31 @@ def main(
     )
     cost = scheduler.predict_offloading_cost(set(offloaded_jobs.keys()))
 
-    log_predictions(runs_dir, offloading_strategy.value, runtime, offloaded_jobs, cost)
+    log_predictions(
+        runs_dir,
+        offloading_strategy.value,
+        runtime,
+        offloaded_jobs,
+        cost,
+        profiling_environment.value,
+    )
     return runtime, offloaded_jobs, cost
 
 
 def run_main_safely(
     runs_dir: str,
-    deadline: int,
+    deadline: int | None,
     offloading_strategy: OffloadingStrategy,
+    profiling_environment: ProfilingEnvironment,
     corr_threshold: float,
 ):
     try:
-        return main(runs_dir, deadline, offloading_strategy, corr_threshold)
+        return main(
+            runs_dir,
+            deadline,
+            offloading_strategy,
+            profiling_environment,
+            corr_threshold,
+        )
     except Exception as e:
         logger.exception("An error occurred during workflow prediction:")

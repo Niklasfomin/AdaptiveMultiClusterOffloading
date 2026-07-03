@@ -182,6 +182,7 @@ def log_predictions(
     runtime: float,
     offloaded_jobs: dict,
     cost: float,
+    profiling_environment: str | None = None,
 ):
     path = Path(".sou/latest_workflow_predictions.json")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,6 +202,7 @@ def log_predictions(
     entry = {
         "runs_directory": str(runs_dir),
         "offloading_strategy": offloading_strategy,
+        "profiling_environment": profiling_environment,
         "prediction": runtime,
         "offloaded_jobs": offloaded_jobs,
         "cost": cost,
