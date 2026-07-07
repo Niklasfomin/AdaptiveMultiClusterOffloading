@@ -129,6 +129,7 @@ start_contention() {
 
 read -r CPU_SCORE RAM_SCORE READ_IOPS WRITE_IOPS IO_SCORE < <(run_benchmark "$FIO_FILE")
 
+CONTENTION_SCORE=""
 CONTENTION_JSON=""
 if [[ "$WITH_CONTENTION" == true ]]; then
   start_contention
@@ -194,12 +195,24 @@ TMP_FILE="$OUT/.lotaru-g.$HOST.tmp"
   flock -x 200
 
   if [[ -f "$LOTARU_CSV" ]]; then
-    awk -F',' -v host="$HOST" 'NR == 1 || $1 != host' "$LOTARU_CSV" > "$TMP_FILE"
+    awk -F',' -v host="$HOST" '
+      NR == 1 {
+        print "node,cpu_score,io_score,contention_score"
+        next
+      }
+      $1 != host {
+        if (NF < 4) {
+          print $1 "," $2 "," $3 ","
+        } else {
+          print $1 "," $2 "," $3 "," $4
+        }
+      }
+    ' "$LOTARU_CSV" > "$TMP_FILE"
   else
-    echo "node,cpu_score,io_score" > "$TMP_FILE"
+    echo "node,cpu_score,io_score,contention_score" > "$TMP_FILE"
   fi
 
-  echo "$HOST,$CPU_SCORE,$IO_SCORE" >> "$TMP_FILE"
+  echo "$HOST,$CPU_SCORE,$IO_SCORE,$CONTENTION_SCORE" >> "$TMP_FILE"
   mv "$TMP_FILE" "$LOTARU_CSV"
 
 ) 200>"$LOCK_FILE"
