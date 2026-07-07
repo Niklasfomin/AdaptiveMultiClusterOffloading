@@ -2,7 +2,9 @@ import argparse
 import asyncio
 import logging
 import shlex
+import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -361,6 +363,197 @@ def build_snakemake_command(jobs_to_offload=None) -> str:
     return command
 
 
+def run_checked(command: list[str]) -> str:
+    logger.debug("Running command: %s", shlex.join(command))
+    result = subprocess.run(
+        command,
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.stderr.strip():
+        logger.debug(result.stderr.strip())
+    return result.stdout
+
+
+def default_profiling_manifest_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "py-lotaru" / "k8s"
+
+
+def run_remote_profiling(
+    kube_contexts: list[str],
+    manifest_dir: Path,
+    namespace: str,
+    timeout_seconds: int,
+) -> None:
+    daemonset_manifest = manifest_dir / "lotaru-g-daemonset.yaml"
+    collector_manifest = manifest_dir / "lotaru-g-results-pod.yaml"
+    missing = [
+        manifest
+        for manifest in [daemonset_manifest, collector_manifest]
+        if not manifest.exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Missing profiling manifest(s): " + ", ".join(str(path) for path in missing)
+        )
+
+    for context in kube_contexts:
+        logger.info("Ensuring result collector exists in context '%s'", context)
+        collector_exists = (
+            subprocess.run(
+                [
+                    "kubectl",
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "get",
+                    "pod/lotaru-benchmark-results",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            ).returncode
+            == 0
+        )
+        if collector_exists:
+            logger.info("Result collector already exists in context '%s'", context)
+        else:
+            run_checked(
+                [
+                    "kubectl",
+                    "--context",
+                    context,
+                    "-n",
+                    namespace,
+                    "apply",
+                    "-f",
+                    str(collector_manifest),
+                ]
+            )
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "wait",
+                "--for=condition=Ready",
+                "pod/lotaru-benchmark-results",
+                "--timeout=120s",
+            ]
+        )
+
+    for context in kube_contexts:
+        logger.info("Clearing previous profiling results in context '%s'", context)
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "exec",
+                "lotaru-benchmark-results",
+                "--",
+                "sh",
+                "-c",
+                "rm -f /results/lotaru-benchmark/*.rich.json /results/lotaru-benchmark/lotaru-g.csv",
+            ]
+        )
+
+    for context in kube_contexts:
+        logger.info("Starting remote profiling in context '%s'", context)
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "apply",
+                "-f",
+                str(daemonset_manifest),
+            ]
+        )
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "rollout",
+                "restart",
+                "daemonset/lotaru-g-benchmark",
+            ]
+        )
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "rollout",
+                "status",
+                "daemonset/lotaru-g-benchmark",
+                f"--timeout={timeout_seconds}s",
+            ]
+        )
+
+    for context in kube_contexts:
+        deadline = time.monotonic() + timeout_seconds
+        csv = ""
+        while time.monotonic() < deadline:
+            try:
+                csv = run_checked(
+                    [
+                        "kubectl",
+                        "--context",
+                        context,
+                        "-n",
+                        namespace,
+                        "exec",
+                        "lotaru-benchmark-results",
+                        "--",
+                        "cat",
+                        "/results/lotaru-benchmark/lotaru-g.csv",
+                    ]
+                )
+            except subprocess.CalledProcessError as error:
+                logger.debug("CSV not ready yet: %s", error)
+                time.sleep(5)
+                continue
+            if len(csv.strip().splitlines()) > 1:
+                break
+            time.sleep(5)
+        else:
+            raise TimeoutError(
+                f"No profiling results found for context '{context}' within {timeout_seconds}s"
+            )
+
+        logger.info("Profiling results for '%s':\n%s", context, csv.strip())
+
+        logger.info("Cleaning up profiling pods in context '%s'", context)
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "delete",
+                "daemonset/lotaru-g-benchmark",
+                "pod/lotaru-benchmark-results",
+                "--ignore-not-found=true",
+            ]
+        )
+
+
 def run_tui(snakemake_args: list[str]):
     set_snakemake_params(format_snakemake_args(snakemake_args))
     app = SnakemakeOffloadingUtility()
@@ -387,9 +580,20 @@ def run_cli(argv: list[str]):
         description="Run SOU without the TUI and print logs to the terminal.",
     )
     parser.add_argument("--cli", action="store_true")
-    parser.add_argument("--runs-dir", required=True)
+    parser.add_argument(
+        "--exec",
+        action="store_true",
+        help="execute Snakemake; with --runs-dir executes after prediction, without --runs-dir runs directly without prediction/offloading selection",
+    )
+    parser.add_argument("--runs-dir")
     parser.add_argument("--deadline-minutes", type=float)
     parser.add_argument("--corr-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--log-level",
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="terminal log level for CLI mode",
+    )
     parser.add_argument(
         "--offloading-strategy",
         default=OffloadingStrategy.NONE.value,
@@ -400,14 +604,83 @@ def run_cli(argv: list[str]):
         default=ProfilingEnvironment.NONE.value,
         type=lambda value: parse_enum(ProfilingEnvironment, value),
     )
+    parser.add_argument(
+        "--remote-profiling",
+        action="store_true",
+        help="profile configured Kubernetes clusters with Lotaru-G and print the CSV results",
+    )
+    parser.add_argument(
+        "--kube-context",
+        dest="kube_contexts",
+        action="append",
+        default=[],
+        help="Kubernetes context to profile; can be passed multiple times",
+    )
+    parser.add_argument(
+        "--profiling-manifest-dir",
+        default=str(default_profiling_manifest_dir()),
+        help="directory containing Lotaru-G Kubernetes manifests",
+    )
+    parser.add_argument(
+        "--profiling-namespace",
+        default="default",
+        help="Kubernetes namespace for profiling resources",
+    )
+    parser.add_argument(
+        "--profiling-timeout-seconds",
+        type=int,
+        default=900,
+        help="maximum time to wait for profiling CSV results per context",
+    )
 
     if snakemake_args is None:
         args, snakemake_args = parser.parse_known_args(sou_args)
     else:
         args = parser.parse_args(sou_args)
 
+    log_level = getattr(logging, args.log_level)
+    logger.setLevel(log_level)
+    logging.basicConfig(
+        level=log_level,
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if args.remote_profiling:
+        if not args.kube_contexts:
+            parser.error("--remote-profiling requires at least one --kube-context")
+        try:
+            run_remote_profiling(
+                args.kube_contexts,
+                Path(args.profiling_manifest_dir),
+                args.profiling_namespace,
+                args.profiling_timeout_seconds,
+            )
+        except subprocess.CalledProcessError as error:
+            message = (error.stderr or error.stdout or str(error)).strip()
+            logger.error("Remote profiling failed: %s", message)
+            return error.returncode
+        except (FileNotFoundError, TimeoutError) as error:
+            logger.error("Remote profiling failed: %s", error)
+            return 1
+        return 0
+
     if not snakemake_args:
         parser.error("missing Snakemake arguments; pass them after '--'")
+
+    set_snakemake_params(format_snakemake_args(snakemake_args))
+
+    if not args.runs_dir:
+        if not args.exec:
+            parser.error(
+                "--runs-dir is required unless --exec is used for direct execution"
+            )
+        command = build_snakemake_command()
+        print(
+            "No --runs-dir provided. Skipping prediction and executing Snakemake directly."
+        )
+        print(f"Command: '{command}'")
+        return run_command(command, live=True)
 
     if args.profiling_environment in {
         ProfilingEnvironment.LOCAL,
@@ -427,13 +700,6 @@ def run_cli(argv: list[str]):
         and deadline_seconds is None
     ):
         parser.error("selected offloading strategy requires --deadline-minutes")
-
-    set_snakemake_params(format_snakemake_args(snakemake_args))
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="[%(asctime)s] [%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
 
     result = sou.scheduler.run_main_safely(
         args.runs_dir,
@@ -463,6 +729,9 @@ def run_cli(argv: list[str]):
 
     command = build_snakemake_command(offloaded_jobs)
     print(f"Command: '{command}'")
+    if not args.exec:
+        print("Prediction finished. Snakemake was not executed; pass --exec to run it.")
+        return 0
     return run_command(command, live=True)
 
 
