@@ -1,5 +1,7 @@
+import argparse
 import asyncio
 import logging
+import shlex
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -58,9 +60,6 @@ class ParameterRow(HorizontalGroup):
         yield self.field
 
 
-# TODO: Add button for local and remote profiling
-# TODO: Add cost model for GKE and data tranmission costs
-# TODO: Add more options for model training
 class Parameters(VerticalGroup):
     def compose(self) -> ComposeResult:
         yield ParameterRow(
@@ -341,12 +340,29 @@ class SnakemakeOffloadingUtility(App):
                     )
 
 
-def main():
-    if not Path(".sou").exists():
-        Path(".sou").mkdir()
+def parse_enum(enum_cls, value: str):
+    for item in enum_cls:
+        if value in {item.name, item.value}:
+            return item
+    choices = ", ".join(item.value for item in enum_cls)
+    raise argparse.ArgumentTypeError(
+        f"invalid value '{value}'. Choose one of: {choices}"
+    )
 
-    snakemake_args = sys.argv[1:]
-    set_snakemake_params(" ".join(snakemake_args))
+
+def format_snakemake_args(args: list[str]) -> str:
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def build_snakemake_command(jobs_to_offload=None) -> str:
+    command = f"snakemake {get_snakemake_params()}"
+    if jobs_to_offload:
+        command += f" --offloader-jobs {','.join(map(str, jobs_to_offload))}"
+    return command
+
+
+def run_tui(snakemake_args: list[str]):
+    set_snakemake_params(format_snakemake_args(snakemake_args))
     app = SnakemakeOffloadingUtility()
     command = app.run()
     if command is None:
@@ -354,4 +370,107 @@ def main():
         return 1
     print(f"Executing Snakemake. Jobs selected for offloading: {app.jobs_to_offload}")
     print(f"Command: '{command}'")
-    run_command(command, live=True)
+    return run_command(command, live=True)
+
+
+def run_cli(argv: list[str]):
+    if "--" in argv:
+        separator_index = argv.index("--")
+        sou_args = argv[:separator_index]
+        snakemake_args = argv[separator_index + 1 :]
+    else:
+        sou_args = argv
+        snakemake_args = None
+
+    parser = argparse.ArgumentParser(
+        prog="sou --cli",
+        description="Run SOU without the TUI and print logs to the terminal.",
+    )
+    parser.add_argument("--cli", action="store_true")
+    parser.add_argument("--runs-dir", required=True)
+    parser.add_argument("--deadline-minutes", type=float)
+    parser.add_argument("--corr-threshold", type=float, default=0.8)
+    parser.add_argument(
+        "--offloading-strategy",
+        default=OffloadingStrategy.NONE.value,
+        type=lambda value: parse_enum(OffloadingStrategy, value),
+    )
+    parser.add_argument(
+        "--profiling-environment",
+        default=ProfilingEnvironment.NONE.value,
+        type=lambda value: parse_enum(ProfilingEnvironment, value),
+    )
+
+    if snakemake_args is None:
+        args, snakemake_args = parser.parse_known_args(sou_args)
+    else:
+        args = parser.parse_args(sou_args)
+
+    if not snakemake_args:
+        parser.error("missing Snakemake arguments; pass them after '--'")
+
+    if args.profiling_environment in {
+        ProfilingEnvironment.LOCAL,
+        ProfilingEnvironment.REMOTE,
+    }:
+        parser.error(
+            "selected profiling environment is not supported for CLI execution"
+        )
+
+    deadline_seconds = args.deadline_minutes * 60 if args.deadline_minutes else None
+    if (
+        args.offloading_strategy
+        in {
+            OffloadingStrategy.LONGEST_JOB_FIRST,
+            OffloadingStrategy.SMALLEST_INPUT_SIZE_FIRST,
+        }
+        and deadline_seconds is None
+    ):
+        parser.error("selected offloading strategy requires --deadline-minutes")
+
+    set_snakemake_params(format_snakemake_args(snakemake_args))
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    result = sou.scheduler.run_main_safely(
+        args.runs_dir,
+        deadline_seconds,
+        args.offloading_strategy,
+        args.profiling_environment,
+        args.corr_threshold,
+    )
+    if not result:
+        return 1
+
+    runtime, offloaded_jobs, cost = result
+    print("")
+    print(f"Predicted workflow makespan: {runtime / 60:.2f} minutes")
+    if args.offloading_strategy != OffloadingStrategy.NONE:
+        if deadline_seconds:
+            if runtime > deadline_seconds:
+                print(
+                    f"Makespan prediction exceeds deadline of {deadline_seconds / 60:.2f} minutes"
+                )
+            else:
+                print(
+                    f"Makespan prediction meets deadline of {deadline_seconds / 60:.2f} minutes"
+                )
+        print(f"Predicted offloading costs: ${cost:.2f}")
+    print(f"Jobs selected for offloading: {offloaded_jobs}")
+
+    command = build_snakemake_command(offloaded_jobs)
+    print(f"Command: '{command}'")
+    return run_command(command, live=True)
+
+
+def main():
+    if not Path(".sou").exists():
+        Path(".sou").mkdir()
+
+    argv = sys.argv[1:]
+    if "--cli" in argv:
+        return run_cli(argv)
+    return run_tui(argv)
