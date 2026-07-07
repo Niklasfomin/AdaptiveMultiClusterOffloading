@@ -1,0 +1,10 @@
+{
+  "node": "tux",
+  "cores": 24,
+  "memory_gb": 93,
+  "cpu_events_s": 1152.18,
+  "ram_score": 19662.95,
+  "read_iops": 20517,
+  "write_iops": 23606,
+  "profile_time_s": 37
+}

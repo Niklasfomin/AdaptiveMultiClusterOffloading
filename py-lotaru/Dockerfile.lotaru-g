@@ -1,0 +1,18 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache \
+    bash \
+    coreutils \
+    fio \
+    gawk \
+    python3 \
+    sysbench \
+    util-linux
+
+COPY lotaru-g.sh /usr/local/bin/lotaru-g.sh
+RUN chmod +x /usr/local/bin/lotaru-g.sh
+
+ENV OUT=/results \
+    SCRATCH=/scratch
+
+ENTRYPOINT ["/usr/local/bin/lotaru-g.sh"]

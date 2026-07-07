@@ -1,0 +1,21 @@
+{
+  "node": "tux",
+  "cores": 24,
+  "memory_gb": 93,
+  "cpu_events_s": 1202.76,
+  "ram_score": 19389.68,
+  "read_iops": 20086,
+  "write_iops": 23956,
+  "io_score": 22021.0,
+  "contended_cpu_events_s": 379.40,
+  "contended_ram_score": 8285.97,
+  "contended_read_iops": 7488,
+  "contended_write_iops": 10247,
+  "contended_io_score": 8867.5,
+  "cpu_contention_ratio": 0.3154,
+  "ram_contention_ratio": 0.4273,
+  "read_contention_ratio": 0.3728,
+  "write_contention_ratio": 0.4277,
+  "contention_score": 0.3858,
+  "profile_time_s": 84
+}
