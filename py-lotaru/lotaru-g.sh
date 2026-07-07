@@ -22,7 +22,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-for cmd in sysbench fio python3 awk flock hostname nproc; do
+for cmd in sysbench fio python3 awk hostname nproc; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "Missing required command: $cmd" >&2
     exit 1
@@ -187,35 +187,5 @@ cat > "$OUT/$HOST.rich.json" <<EOF
 }
 EOF
 
-LOTARU_CSV="$OUT/lotaru-g.csv"
-LOCK_FILE="$OUT/.lotaru-g.lock"
-TMP_FILE="$OUT/.lotaru-g.$HOST.tmp"
-
-(
-  flock -x 200
-
-  if [[ -f "$LOTARU_CSV" ]]; then
-    awk -F',' -v host="$HOST" '
-      NR == 1 {
-        print "node,cpu_score,io_score,contention_score"
-        next
-      }
-      $1 != host {
-        if (NF < 4) {
-          print $1 "," $2 "," $3 ","
-        } else {
-          print $1 "," $2 "," $3 "," $4
-        }
-      }
-    ' "$LOTARU_CSV" > "$TMP_FILE"
-  else
-    echo "node,cpu_score,io_score,contention_score" > "$TMP_FILE"
-  fi
-
-  echo "$HOST,$CPU_SCORE,$IO_SCORE,$CONTENTION_SCORE" >> "$TMP_FILE"
-  mv "$TMP_FILE" "$LOTARU_CSV"
-
-) 200>"$LOCK_FILE"
-
 echo "wrote $OUT/$HOST.rich.json"
-echo "updated $OUT/lotaru-g.csv"
+echo "lotaru-g.csv is rebuilt by the collector pod"

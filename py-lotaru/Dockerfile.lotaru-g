@@ -6,8 +6,7 @@ RUN apk add --no-cache \
     fio \
     gawk \
     python3 \
-    sysbench \
-    util-linux
+    sysbench
 
 COPY lotaru-g.sh /usr/local/bin/lotaru-g.sh
 RUN chmod +x /usr/local/bin/lotaru-g.sh

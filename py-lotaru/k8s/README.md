@@ -17,7 +17,7 @@ bash k8s/run-lotaru-g-benchmark.sh
 The script applies:
 
 - `lotaru-g-daemonset.yaml` — runs `lotaru-g.sh --contention` once per node, then sleeps.
-- `lotaru-g-results-pod.yaml` — stable pod used for a single `kubectl cp`.
+- `lotaru-g-results-pod.yaml` — stable pod used for a single `kubectl cp`; it rebuilds `lotaru-g.csv` from all `*.rich.json` files every 5 seconds.
 
 Local output:
 
@@ -53,16 +53,18 @@ It is mounted at `/results`, and benchmark data is written under:
 /results/lotaru-benchmark
 ```
 
-Each node writes:
+Each benchmark pod writes only its node-local JSON file:
 
 ```text
 /results/lotaru-benchmark/<node>.rich.json
 ```
 
-All nodes update:
+The collector pod rebuilds the combined CSV from all JSON files:
 
 ```text
 /results/lotaru-benchmark/lotaru-g.csv
 ```
+
+This avoids lost CSV rows when multiple clusters write to the same NFS-backed PVC.
 
 Scratch I/O uses host path `/var/tmp/lotaru-fio` to benchmark node-local storage.

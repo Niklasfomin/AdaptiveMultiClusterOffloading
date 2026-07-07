@@ -8,11 +8,51 @@ spec:
   restartPolicy: Never
   containers:
     - name: results
-      image: alpine:3.20
+      image: python:3.12-alpine
       command:
-        - sh
+        - python3
+        - -u
         - -c
-        - sleep infinity
+      args:
+        - |
+          import csv
+          import glob
+          import json
+          import os
+          import tempfile
+          import time
+
+          out_dir = "/results/lotaru-benchmark"
+          interval = int(os.environ.get("CSV_REBUILD_INTERVAL_SECONDS", "5"))
+          os.makedirs(out_dir, exist_ok=True)
+
+          while True:
+              csv_path = os.path.join(out_dir, "lotaru-g.csv")
+              fd, tmp_path = tempfile.mkstemp(
+                  prefix=".lotaru-g.", suffix=".tmp", dir=out_dir, text=True
+              )
+              try:
+                  with os.fdopen(fd, "w", newline="") as handle:
+                      writer = csv.writer(handle)
+                      writer.writerow(["node", "cpu_score", "io_score", "contention_score"])
+                      for path in sorted(glob.glob(os.path.join(out_dir, "*.rich.json"))):
+                          with open(path, encoding="utf-8") as json_file:
+                              data = json.load(json_file)
+                          writer.writerow([
+                              data.get("node", os.path.basename(path).removesuffix(".rich.json")),
+                              data.get("cpu_events_s", ""),
+                              data.get("io_score", ""),
+                              data.get("contention_score", ""),
+                          ])
+                  os.replace(tmp_path, csv_path)
+                  print(f"rebuilt {csv_path}", flush=True)
+              finally:
+                  if os.path.exists(tmp_path):
+                      os.unlink(tmp_path)
+              time.sleep(interval)
+      env:
+        - name: CSV_REBUILD_INTERVAL_SECONDS
+          value: "5"
       volumeMounts:
         - name: results
           mountPath: /results
