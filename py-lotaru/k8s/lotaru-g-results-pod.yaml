@@ -19,4 +19,4 @@ spec:
   volumes:
     - name: results
       persistentVolumeClaim:
-        claimName: lotaru-benchmark-results
+        claimName: snakemake-shared

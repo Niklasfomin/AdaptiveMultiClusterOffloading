@@ -6,6 +6,8 @@ Build the image:
 docker build -f Dockerfile.lotaru-g -t lotaru-g-benchmark:latest .
 ```
 
+For a remote cluster, push the image to a registry and set the image in `lotaru-g-daemonset.yaml`.
+
 Run on every node and fetch results to your laptop:
 
 ```bash
@@ -39,18 +41,28 @@ kubectl delete -f k8s/lotaru-g-results-pod.yaml
 
 ## Output location
 
-Cluster output is written to a shared `ReadWriteMany` PVC mounted at `/results`.
+Cluster output uses the existing RWX PVC:
+
+```text
+snakemake-shared
+```
+
+It is mounted at `/results`, and benchmark data is written under:
+
+```text
+/results/lotaru-benchmark
+```
 
 Each node writes:
 
 ```text
-/results/<node>.rich.json
+/results/lotaru-benchmark/<node>.rich.json
 ```
 
 All nodes update:
 
 ```text
-/results/lotaru-g.csv
+/results/lotaru-benchmark/lotaru-g.csv
 ```
 
 Scratch I/O uses host path `/var/tmp/lotaru-fio` to benchmark node-local storage.

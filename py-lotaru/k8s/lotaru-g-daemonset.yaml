@@ -29,7 +29,7 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: OUT
-              value: /results
+              value: /results/lotaru-benchmark
             - name: SCRATCH
               value: /scratch
             - name: CONTENTION_RUNTIME
@@ -46,19 +46,8 @@ spec:
       volumes:
         - name: results
           persistentVolumeClaim:
-            claimName: lotaru-benchmark-results
+            claimName: snakemake-shared
         - name: scratch
           hostPath:
             path: /var/tmp/lotaru-fio
             type: DirectoryOrCreate
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: lotaru-benchmark-results
-spec:
-  accessModes:
-    - ReadWriteMany
-  resources:
-    requests:
-      storage: 1Gi

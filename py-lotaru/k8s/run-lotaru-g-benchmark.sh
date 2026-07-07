@@ -16,7 +16,7 @@ DEADLINE=$((SECONDS + TIMEOUT_SECONDS))
 
 echo "waiting for $NODE_COUNT benchmark result files..."
 while true; do
-  RESULT_COUNT=$(kubectl exec -n "$NAMESPACE" lotaru-benchmark-results -- sh -c 'find /results -maxdepth 1 -name "*.rich.json" 2>/dev/null | wc -l | tr -d " "')
+  RESULT_COUNT=$(kubectl exec -n "$NAMESPACE" lotaru-benchmark-results -- sh -c 'find /results/lotaru-benchmark -maxdepth 1 -name "*.rich.json" 2>/dev/null | wc -l | tr -d " "')
   if [[ "$RESULT_COUNT" -ge "$NODE_COUNT" ]]; then
     break
   fi
@@ -28,7 +28,7 @@ while true; do
 done
 
 rm -rf "$OUT_DIR"
-kubectl cp -n "$NAMESPACE" lotaru-benchmark-results:/results "$OUT_DIR"
+kubectl cp -n "$NAMESPACE" lotaru-benchmark-results:/results/lotaru-benchmark "$OUT_DIR"
 
 echo "copied results to $OUT_DIR"
 echo "delete benchmark resources with:"
