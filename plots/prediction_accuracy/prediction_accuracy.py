@@ -9,9 +9,12 @@ from datetime import datetime
 
 import matplotlib.pyplot as plt
 import networkx as nx
+import numpy as np
 import pandas as pd
 import seaborn as sns
-from scipy.stats import pearsonr, spearmanr
+from scipy.stats import norm, pearsonr, spearmanr
+from sklearn.linear_model import BayesianRidge
+from sklearn.metrics import PredictionErrorDisplay
 
 logger = logging.getLogger()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -563,6 +566,462 @@ def plot_input_size_correlations(
         print_correlation_summary(summary, corr_threshold)
 
 
+def _get_mode_df(training_dir, mode):
+    df, _ = collect_stained_glass_input_size_rows(training_dir)
+    mode_df = df[df["mode"] == mode].copy()
+    if mode_df.empty:
+        raise ValueError(f"No rows found for mode '{mode}' in {training_dir}")
+    return mode_df
+
+
+def _select_rule(mode_df, rule=None):
+    if rule:
+        rule_df = mode_df[mode_df["rule"] == rule].copy()
+        if rule_df.empty:
+            raise ValueError(f"Rule '{rule}' not found")
+        return rule, rule_df
+    selected = mode_df["rule"].value_counts().idxmax()
+    return selected, mode_df[mode_df["rule"] == selected].copy()
+
+
+def _fit_bayesian_model(rule_df, **kwargs):
+    x = rule_df["input_size_mb"].to_numpy().reshape(-1, 1)
+    y = rule_df["runtime_s"].to_numpy()
+    model = BayesianRidge(**kwargs)
+    model.fit(x, y)
+    return model, x, y
+
+
+def plot_prediction_with_uncertainty_band(
+    training_dir, workflow, mode="total", rule=None
+):
+    mode_df = _get_mode_df(training_dir, mode)
+    rule_name, rule_df = _select_rule(mode_df, rule)
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"bayesian_uncertainty_{workflow}_{mode}_{rule_name}.png",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    if len(rule_df) < 3 or rule_df["input_size_mb"].nunique() < 2:
+        raise ValueError(f"Rule '{rule_name}' has insufficient data for regression")
+
+    model, _, _ = _fit_bayesian_model(rule_df)
+    x_min = rule_df["input_size_mb"].min()
+    x_max = rule_df["input_size_mb"].max()
+    x_grid = np.linspace(x_min, x_max, 200)
+    mean, std = model.predict(x_grid.reshape(-1, 1), return_std=True)
+
+    plt.figure(figsize=(7, 4))
+    plt.scatter(rule_df["input_size_mb"], rule_df["runtime_s"], s=30, label="Actual")
+    plt.plot(x_grid, mean, color="#1f77b4", label="Predicted mean")
+    plt.fill_between(
+        x_grid,
+        mean - 1.96 * std,
+        mean + 1.96 * std,
+        color="#1f77b4",
+        alpha=0.2,
+        label="95% interval",
+    )
+    plt.xlabel("Input size [MB]")
+    plt.ylabel("Runtime [s]")
+    plt.title(f"{workflow} | {rule_name} | Bayesian uncertainty ({mode})")
+    plt.legend()
+    plt.grid(True, color="lightgray", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"wrote {out}")
+
+
+def plot_actual_vs_predicted_runtime(training_dir, workflow, mode="total", rule=None):
+    mode_df = _get_mode_df(training_dir, mode)
+    rule_name, rule_df = _select_rule(mode_df, rule)
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"prediction_error_{workflow}_{mode}_{rule_name}.png",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    if len(rule_df) < 3 or rule_df["input_size_mb"].nunique() < 2:
+        raise ValueError(f"Rule '{rule_name}' has insufficient data for regression")
+
+    model, x, y = _fit_bayesian_model(rule_df)
+    y_pred = model.predict(x)
+
+    fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+    PredictionErrorDisplay.from_predictions(
+        y,
+        y_pred,
+        kind="actual_vs_predicted",
+        ax=axes[0],
+        scatter_kwargs={"s": 30},
+    )
+    axes[0].set_title("Actual vs predicted")
+
+    PredictionErrorDisplay.from_predictions(
+        y,
+        y_pred,
+        kind="residual_vs_predicted",
+        ax=axes[1],
+        scatter_kwargs={"s": 30},
+    )
+    axes[1].set_title("Residuals vs predicted")
+
+    fig.suptitle(
+        f"{workflow} | {rule_name} | Bayesian prediction error ({mode})", y=1.02
+    )
+    fig.tight_layout()
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"wrote {out}")
+
+
+def _collect_bayesian_coefficients(training_dir, mode="total"):
+    mode_df = _get_mode_df(training_dir, mode)
+    rows = []
+    for rule_name, rule_df in mode_df.groupby("rule"):
+        if len(rule_df) < 3 or rule_df["input_size_mb"].nunique() < 2:
+            continue
+        model, _, _ = _fit_bayesian_model(rule_df)
+        rows.append(
+            {
+                "rule": rule_name,
+                "coefficient": float(np.ravel(model.coef_)[0]),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def plot_coefficient_comparison(training_dir, workflow, mode="total"):
+    out = os.path.join(SCRIPT_DIR, f"bayesian_coefficients_{workflow}_{mode}.png")
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    coef_df = _collect_bayesian_coefficients(training_dir, mode)
+    if coef_df.empty:
+        raise ValueError("No Bayesian coefficients available for plotting")
+
+    plt.figure(figsize=(10, 5))
+    sns.barplot(data=coef_df, x="rule", y="coefficient", color="#1f77b4")
+    plt.xticks(rotation=60, ha="right")
+    plt.xlabel("Rule")
+    plt.ylabel("Bayesian coefficient")
+    plt.title(f"{workflow} | Bayesian coefficients ({mode})")
+    plt.tight_layout()
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"wrote {out}")
+
+
+def plot_coefficient_histogram(training_dir, workflow, mode="total"):
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"bayesian_coefficient_histogram_{workflow}_{mode}.png",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    coef_df = _collect_bayesian_coefficients(training_dir, mode)
+    if coef_df.empty:
+        raise ValueError("No Bayesian coefficients available for histogram")
+
+    plt.figure(figsize=(7, 4))
+    sns.histplot(data=coef_df, x="coefficient", bins=20, color="#1f77b4")
+    plt.xlabel("Bayesian coefficient")
+    plt.ylabel("Count")
+    plt.title(f"{workflow} | Bayesian coefficient histogram ({mode})")
+    plt.tight_layout()
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"wrote {out}")
+
+
+def plot_posterior_with_two_gaussian_priors(
+    training_dir,
+    workflow,
+    mode="total",
+    rule=None,
+    all_rules=False,
+):
+    mode_df = _get_mode_df(training_dir, mode)
+    grouped = list(mode_df.groupby("rule"))
+
+    if all_rules:
+        selected = grouped
+    else:
+        rule_name, rule_df = _select_rule(mode_df, rule)
+        selected = [(rule_name, rule_df)]
+
+    # Prior A: weakly-informative (wide Gaussian prior over weights)
+    weak_prior = {
+        "alpha_1": 1e-6,
+        "alpha_2": 1e-6,
+        "lambda_1": 1e-6,
+        "lambda_2": 1e-6,
+    }
+    # Prior B: stronger shrinkage toward zero (narrower effective prior)
+    strong_prior = {
+        "alpha_1": 1e-2,
+        "alpha_2": 1e-2,
+        "lambda_1": 1.0,
+        "lambda_2": 1.0,
+    }
+
+    for rule_name, rule_df in selected:
+        if len(rule_df) < 3 or rule_df["input_size_mb"].nunique() < 2:
+            continue
+
+        out = os.path.join(
+            SCRIPT_DIR,
+            f"bayesian_two_priors_{workflow}_{mode}_{rule_name}.png",
+        )
+        if os.path.exists(out):
+            print(f"skip existing {out}")
+            continue
+
+        x_min = rule_df["input_size_mb"].min()
+        x_max = rule_df["input_size_mb"].max()
+        x_grid = np.linspace(x_min, x_max, 200)
+
+        weak_model, _, _ = _fit_bayesian_model(rule_df, **weak_prior)
+        strong_model, _, _ = _fit_bayesian_model(rule_df, **strong_prior)
+
+        weak_mean, weak_std = weak_model.predict(x_grid.reshape(-1, 1), return_std=True)
+        strong_mean, strong_std = strong_model.predict(
+            x_grid.reshape(-1, 1), return_std=True
+        )
+
+        plt.figure(figsize=(8, 4.5))
+        plt.scatter(
+            rule_df["input_size_mb"],
+            rule_df["runtime_s"],
+            s=30,
+            c="black",
+            alpha=0.7,
+            label="Actual runtime",
+        )
+
+        plt.plot(
+            x_grid, weak_mean, color="#1f77b4", label="Posterior mean (weak prior)"
+        )
+        plt.fill_between(
+            x_grid,
+            weak_mean - 1.96 * weak_std,
+            weak_mean + 1.96 * weak_std,
+            color="#1f77b4",
+            alpha=0.18,
+            label="95% interval (weak prior)",
+        )
+
+        plt.plot(
+            x_grid,
+            strong_mean,
+            color="#ff7f0e",
+            label="Posterior mean (strong prior)",
+        )
+        plt.fill_between(
+            x_grid,
+            strong_mean - 1.96 * strong_std,
+            strong_mean + 1.96 * strong_std,
+            color="#ff7f0e",
+            alpha=0.15,
+            label="95% interval (strong prior)",
+        )
+
+        plt.xlabel("Input size [MB]")
+        plt.ylabel("Runtime [s]")
+        plt.title(
+            f"{workflow} | {rule_name} | Bayesian posterior with two priors ({mode})"
+        )
+        plt.grid(True, color="lightgray", linestyle="--", linewidth=0.5)
+        plt.legend(fontsize=8)
+        plt.tight_layout()
+        plt.savefig(out, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"wrote {out}")
+
+
+def export_bayesian_percentile_predictions(training_dir, workflow, mode="total"):
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"bayesian_percentiles_{workflow}_{mode}.json",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    mode_df = _get_mode_df(training_dir, mode)
+    records = []
+
+    for rule_name, rule_df in mode_df.groupby("rule"):
+        if len(rule_df) < 3 or rule_df["input_size_mb"].nunique() < 2:
+            continue
+
+        model, x, _ = _fit_bayesian_model(rule_df)
+        y_mean, y_std = model.predict(x, return_std=True)
+        p50 = y_mean
+        p80 = y_mean + norm.ppf(0.80) * y_std
+        p90 = y_mean + norm.ppf(0.90) * y_std
+        p95 = y_mean + norm.ppf(0.95) * y_std
+
+        for i in range(len(rule_df)):
+            records.append(
+                {
+                    "rule": rule_name,
+                    "pred_mean": float(y_mean[i]),
+                    "pred_std": float(y_std[i]),
+                    "pred_p50": float(p50[i]),
+                    "pred_p80": float(p80[i]),
+                    "pred_p90": float(p90[i]),
+                    "pred_p95": float(p95[i]),
+                    "actual_runtime": float(rule_df["runtime_s"].iloc[i]),
+                    "input_size_mb": float(rule_df["input_size_mb"].iloc[i]),
+                    "model": "bayesian_ridge",
+                    "model_coef": np.ravel(model.coef_).tolist(),
+                    "model_sigma": np.asarray(model.sigma_).tolist(),
+                    "model_alpha": float(model.alpha_),
+                    "model_lambda": float(model.lambda_),
+                }
+            )
+
+    with open(out, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+    print(f"wrote {out}")
+
+
+def plot_bayesian_percentile_calibration(json_path, workflow="stained-glass"):
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"bayesian_percentile_calibration_{workflow}.png",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    df = pd.DataFrame(records)
+    if df.empty:
+        raise ValueError("No rows found in percentile JSON")
+
+    # Calibration points per rule and percentile.
+    rows = []
+    for rule, rule_df in df.groupby("rule"):
+        for q in [50, 80, 90, 95]:
+            col = f"pred_p{q}"
+            if col not in rule_df:
+                continue
+            pred_q = rule_df[col].quantile(q / 100)
+            actual_q = rule_df["actual_runtime"].quantile(q / 100)
+            coverage = (rule_df["actual_runtime"] <= rule_df[col]).mean() * 100
+            rows.append(
+                {
+                    "rule": rule,
+                    "percentile": q,
+                    "predicted_quantile": pred_q,
+                    "actual_quantile": actual_q,
+                    "empirical_coverage_percent": coverage,
+                }
+            )
+    cdf = pd.DataFrame(rows)
+    if cdf.empty:
+        raise ValueError("Could not build calibration data")
+
+    g = sns.FacetGrid(cdf, col="rule", col_wrap=3, sharex=False, sharey=False, height=3)
+    g.map_dataframe(
+        sns.lineplot,
+        x="predicted_quantile",
+        y="actual_quantile",
+        marker="o",
+    )
+    for ax, (rule, rule_df) in zip(g.axes.flat, cdf.groupby("rule")):
+        xmin, xmax = ax.get_xlim()
+        ymin, ymax = ax.get_ylim()
+        lo = min(xmin, ymin)
+        hi = max(xmax, ymax)
+        ax.plot([lo, hi], [lo, hi], linestyle="--", color="black", linewidth=1)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+
+        txt = ", ".join(
+            f"p{int(r.percentile)}:{r.empirical_coverage_percent:.0f}%"
+            for _, r in rule_df.sort_values("percentile").iterrows()
+        )
+        ax.text(
+            0.03,
+            0.97,
+            txt,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=8,
+            bbox={"facecolor": "white", "alpha": 0.6, "edgecolor": "none"},
+        )
+
+    g.set_axis_labels("Predicted percentile runtime [s]", "Actual runtime quantile [s]")
+    g.fig.suptitle(f"{workflow} | Bayesian percentile calibration", y=1.02)
+    g.tight_layout()
+    g.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close(g.fig)
+    print(f"wrote {out}")
+
+
+def plot_bayesian_sharpness_vs_error(json_path, workflow="stained-glass"):
+    out = os.path.join(
+        SCRIPT_DIR,
+        f"bayesian_sharpness_vs_error_{workflow}.png",
+    )
+    if os.path.exists(out):
+        print(f"skip existing {out}")
+        return
+
+    with open(json_path, "r", encoding="utf-8") as f:
+        records = json.load(f)
+    df = pd.DataFrame(records)
+    if df.empty:
+        raise ValueError("No rows found in percentile JSON")
+
+    df = df.copy()
+    df["abs_error"] = (df["actual_runtime"] - df["pred_mean"]).abs()
+
+    plt.figure(figsize=(7, 5))
+    sns.scatterplot(
+        data=df,
+        x="pred_std",
+        y="abs_error",
+        hue="rule",
+        s=28,
+        alpha=0.8,
+    )
+    plt.xlabel("Predicted std (uncertainty)")
+    plt.ylabel("Absolute error |actual - pred_mean| [s]")
+    plt.title(f"{workflow} | Bayesian sharpness vs error")
+    plt.grid(True, color="lightgray", linestyle="--", linewidth=0.5)
+    plt.tight_layout()
+    plt.savefig(out, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"wrote {out}")
+
+
+def generate_bayesian_percentile_visuals(json_path, workflow="stained-glass"):
+    plot_bayesian_percentile_calibration(json_path, workflow=workflow)
+    plot_bayesian_sharpness_vs_error(json_path, workflow=workflow)
+
+
+def generate_bayesian_plots(training_dir, workflow, mode="total", rule=None):
+    plot_prediction_with_uncertainty_band(training_dir, workflow, mode=mode, rule=rule)
+    plot_actual_vs_predicted_runtime(training_dir, workflow, mode=mode, rule=rule)
+    plot_coefficient_comparison(training_dir, workflow, mode=mode)
+    plot_coefficient_histogram(training_dir, workflow, mode=mode)
+
+
 def read_files(log_dir, prediction_path, workflow, median_rules):
     # Recursively find all snakemake.log files in log_dir
     log_file_paths = []
@@ -607,6 +1066,37 @@ def main():
         help="Path to a single run snakemake.log/run directory or to a training-runs directory",
     )
     parser.add_argument(
+        "--bayesian-plots",
+        help="Path to training runs directory for Bayesian plot set (uncertainty, prediction error, coefficients)",
+    )
+    parser.add_argument(
+        "--bayesian-mode",
+        choices=["total", "primary", "ancestor"],
+        default="total",
+        help="input-size mode used for Bayesian plot set",
+    )
+    parser.add_argument(
+        "--bayesian-rule",
+        help="optional rule name for uncertainty/prediction-error plots; defaults to rule with most samples",
+    )
+    parser.add_argument(
+        "--bayesian-two-priors",
+        help="Path to training runs directory for posterior plot with two Gaussian priors",
+    )
+    parser.add_argument(
+        "--bayesian-two-priors-all-rules",
+        action="store_true",
+        help="with --bayesian-two-priors, generate one plot per rule",
+    )
+    parser.add_argument(
+        "--bayesian-export-percentiles",
+        help="Path to training runs directory for exporting Bayesian mean/std and p50/p80/p90/p95 per task",
+    )
+    parser.add_argument(
+        "--bayesian-percentile-visuals",
+        help="Path to bayesian_percentiles_*.json for calibration and sharpness/error visuals",
+    )
+    parser.add_argument(
         "--input-mode",
         choices=["total", "primary", "ancestor"],
         default="total",
@@ -626,6 +1116,40 @@ def main():
     )
     parser.add_argument("--workflow", default="stained-glass")
     args = parser.parse_args()
+
+    if args.bayesian_two_priors:
+        plot_posterior_with_two_gaussian_priors(
+            args.bayesian_two_priors,
+            args.workflow,
+            mode=args.bayesian_mode,
+            rule=args.bayesian_rule,
+            all_rules=args.bayesian_two_priors_all_rules,
+        )
+        return
+
+    if args.bayesian_export_percentiles:
+        export_bayesian_percentile_predictions(
+            args.bayesian_export_percentiles,
+            args.workflow,
+            mode=args.bayesian_mode,
+        )
+        return
+
+    if args.bayesian_percentile_visuals:
+        generate_bayesian_percentile_visuals(
+            args.bayesian_percentile_visuals,
+            workflow=args.workflow,
+        )
+        return
+
+    if args.bayesian_plots:
+        generate_bayesian_plots(
+            args.bayesian_plots,
+            args.workflow,
+            mode=args.bayesian_mode,
+            rule=args.bayesian_rule,
+        )
+        return
 
     if args.input_correlation:
         single_run = os.path.isfile(args.input_correlation) or os.path.isdir(

@@ -27,16 +27,20 @@ from sou.snakemake_benchmarks import (  # noqa: E402
 
 logger = logging.getLogger("model-evaluation")
 
+BAYESIAN_MIN_N = 5
+BAYESIAN_MIN_IMPROVEMENT_PERCENT = 10.0
+BAYESIAN_COVERAGE_MIN_PERCENT = 50.0
+BAYESIAN_COVERAGE_MAX_PERCENT = 100.0
+BAYESIAN_MAX_NLPD = 10.0
+
 
 class PredictorModel:
     def __init__(
         self,
         corr_threshold: float,
-        force_linear: bool = False,
         linear_model: str = "sklearn",
     ):
         self.corr_threshold = corr_threshold
-        self.force_linear = force_linear
         self.linear_model = linear_model
 
     def fit_model(self, x_values, y_values):
@@ -64,7 +68,7 @@ class PredictorModel:
             )
             return {"median": median_time}
 
-        if corr < self.corr_threshold and not self.force_linear:
+        if corr < self.corr_threshold:
             median_time = np.median(y_values)
             logger.info(
                 f"Weak correlation ({corr:.2f}). Returning median time: {median_time}s"
@@ -148,16 +152,14 @@ def get_xy(data_points, input_mode: str, target: str):
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
-def evaluate_rule(
+def _evaluate_rule_cv(
     x_values,
     y_values,
     corr_threshold,
-    force_linear=False,
     linear_model="sklearn",
 ):
     predictor = PredictorModel(
         corr_threshold,
-        force_linear=force_linear,
         linear_model=linear_model,
     )
     rows = []
@@ -201,6 +203,100 @@ def evaluate_rule(
             }
         )
     return rows
+
+
+def _evaluate_median_baseline_rows(x_values, y_values):
+    rows = []
+    n = len(x_values)
+    for i in range(n):
+        train_y = y_values[:i] + y_values[i + 1 :]
+        test_x = x_values[i]
+        test_y = y_values[i]
+        baseline = float(np.median(train_y)) if train_y else test_y
+        rows.append(
+            {
+                "actual": test_y,
+                "predicted": baseline,
+                "predicted_std": None,
+                "lower_95": None,
+                "upper_95": None,
+                "covered_95": None,
+                "baseline": baseline,
+                "model_type": "median",
+                "input_size_mb": test_x,
+            }
+        )
+    return rows
+
+
+def evaluate_rule(
+    x_values,
+    y_values,
+    corr_threshold,
+    linear_model="sklearn",
+):
+    if linear_model != "bayesian-ridge":
+        return _evaluate_rule_cv(
+            x_values,
+            y_values,
+            corr_threshold,
+            linear_model=linear_model,
+        )
+
+    n = len(x_values)
+    if n < BAYESIAN_MIN_N:
+        return _evaluate_median_baseline_rows(x_values, y_values)
+
+    bayesian_rows = _evaluate_rule_cv(
+        x_values,
+        y_values,
+        corr_threshold,
+        linear_model="bayesian-ridge",
+    )
+    linear_rows = _evaluate_rule_cv(
+        x_values,
+        y_values,
+        corr_threshold,
+        linear_model="sklearn",
+    )
+    if not bayesian_rows or not linear_rows:
+        return _evaluate_median_baseline_rows(x_values, y_values)
+
+    actual = [r["actual"] for r in bayesian_rows]
+    baseline = [r["baseline"] for r in bayesian_rows]
+    bayesian_pred = [r["predicted"] for r in bayesian_rows]
+    linear_pred = [r["predicted"] for r in linear_rows]
+    bayesian_std = [r["predicted_std"] for r in bayesian_rows]
+
+    baseline_mae = mean_absolute_error(actual, baseline)
+    best_cv_mae = min(
+        mean_absolute_error(actual, bayesian_pred),
+        mean_absolute_error(actual, linear_pred),
+    )
+    improvement_percent = (
+        (baseline_mae - best_cv_mae) / baseline_mae * 100 if baseline_mae else 0.0
+    )
+
+    coverage_values = [
+        r["covered_95"] for r in bayesian_rows if r["covered_95"] is not None
+    ]
+    coverage_95 = np.mean(coverage_values) * 100 if coverage_values else math.nan
+    nlpd = gaussian_nlpd(actual, bayesian_pred, bayesian_std)
+
+    use_bayesian = (
+        improvement_percent >= BAYESIAN_MIN_IMPROVEMENT_PERCENT
+        and np.isfinite(coverage_95)
+        and BAYESIAN_COVERAGE_MIN_PERCENT
+        <= coverage_95
+        <= BAYESIAN_COVERAGE_MAX_PERCENT
+        and np.isfinite(nlpd)
+        and nlpd <= BAYESIAN_MAX_NLPD
+    )
+    return (
+        bayesian_rows
+        if use_bayesian
+        else _evaluate_median_baseline_rows(x_values, y_values)
+    )
 
 
 def safe_mape(actual, predicted):
@@ -283,7 +379,6 @@ def evaluate(
     input_mode,
     target,
     corr_threshold,
-    force_linear=False,
     linear_model="sklearn",
 ):
     datapoints_by_rule, run_count = load_datapoints(path)
@@ -296,7 +391,6 @@ def evaluate(
             x_values,
             y_values,
             corr_threshold,
-            force_linear=force_linear,
             linear_model=linear_model,
         )
         for row in rows:
@@ -357,7 +451,7 @@ def plot_predictions(predictions, workflow, input_mode, target):
     plt.close(g.fig)
 
 
-def print_summary(metrics):
+def print_summary(metrics, model):
     if metrics.empty:
         print("No metrics produced")
         return
@@ -374,17 +468,26 @@ def print_summary(metrics):
     print("- RMSE: penalizes large errors")
     print("- MAPE: relative error, useful across differently scaled rules")
     print("- R²: explained variance, diagnostic only for small n")
-    print("- coverage_95_percent: Bayesian 95% interval calibration; ideal is near 95%")
-    print(
-        "- mean_predicted_std / mean_interval_width_95: Bayesian uncertainty magnitude"
-    )
-    print("- gaussian_nlpd: probabilistic predictive quality; lower is better")
-    print("\nPer-rule metrics:")
-    print(
-        metrics.sort_values("mae_improvement_percent", ascending=False).to_string(
-            index=False
+    if model == "bayesian":
+        print(
+            "- coverage_95_percent: Bayesian 95% interval calibration; ideal is near 95%"
         )
-    )
+        print(
+            "- mean_predicted_std / mean_interval_width_95: Bayesian uncertainty magnitude"
+        )
+        print("- gaussian_nlpd: probabilistic predictive quality; lower is better")
+    print("\nPer-rule metrics:")
+    table = metrics.sort_values("mae_improvement_percent", ascending=False)
+    if model != "bayesian":
+        drop_cols = [
+            "bayesian_folds",
+            "mean_predicted_std",
+            "coverage_95_percent",
+            "mean_interval_width_95",
+            "gaussian_nlpd",
+        ]
+        table = table.drop(columns=[c for c in drop_cols if c in table.columns])
+    print(table.to_string(index=False))
 
 
 def main():
@@ -399,29 +502,22 @@ def main():
     parser.add_argument("--target", choices=["runtime", "wall-time"], default="runtime")
     parser.add_argument("--corr-threshold", type=float, default=0.8)
     parser.add_argument(
-        "--linear-model",
-        choices=["sklearn", "bayesian-ridge"],
-        default="sklearn",
-        help="linear model implementation; bayesian-ridge matches py-lotaru",
-    )
-    parser.add_argument(
-        "--force-linear",
-        action="store_true",
-        help="disable correlation-based median fallback and fit the selected linear model whenever possible",
+        "--model",
+        choices=["linear", "bayesian"],
+        default="linear",
+        help="prediction model to evaluate",
     )
     args = parser.parse_args()
 
+    linear_model = "bayesian-ridge" if args.model == "bayesian" else "sklearn"
     predictions, metrics, _ = evaluate(
         args.input,
         args.input_mode,
         args.target,
         args.corr_threshold,
-        force_linear=args.force_linear,
-        linear_model=args.linear_model,
+        linear_model=linear_model,
     )
-    suffix = f"_{args.linear_model}"
-    if args.force_linear:
-        suffix += "_forced_linear"
+    suffix = f"_{args.model}"
     metrics_path = (
         SCRIPT_DIR
         / f"linear_model_eval_{args.workflow}_{args.input_mode}_{args.target}{suffix}_metrics.csv"
@@ -436,7 +532,7 @@ def main():
     plot_predictions(
         predictions, args.workflow, args.input_mode, f"{args.target}{suffix}"
     )
-    print_summary(metrics)
+    print_summary(metrics, args.model)
     print(f"\nwrote {metrics_path}")
     print(f"wrote {predictions_path}")
 
