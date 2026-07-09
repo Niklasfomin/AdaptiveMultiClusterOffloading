@@ -59,4 +59,4 @@ spec:
   volumes:
     - name: results
       persistentVolumeClaim:
-        claimName: snakemake-shared
+        claimName: snakemake-nfs-pvc

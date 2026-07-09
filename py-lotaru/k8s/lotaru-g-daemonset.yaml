@@ -46,7 +46,7 @@ spec:
       volumes:
         - name: results
           persistentVolumeClaim:
-            claimName: snakemake-shared
+            claimName: snakemake-nfs-pvc
         - name: scratch
           hostPath:
             path: /var/tmp/lotaru-fio
