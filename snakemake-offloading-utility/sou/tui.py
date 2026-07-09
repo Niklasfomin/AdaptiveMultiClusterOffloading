@@ -1,9 +1,12 @@
 import argparse
 import asyncio
+import json
 import logging
+import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -381,11 +384,60 @@ def default_profiling_manifest_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "py-lotaru" / "k8s"
 
 
+def default_local_profiling_script() -> Path:
+    return Path(__file__).resolve().parents[2] / "py-lotaru" / "lotaru-g.sh"
+
+
+def run_local_profiling(script_path: Path, timeout_seconds: int) -> dict[str, float]:
+    if not script_path.exists():
+        raise FileNotFoundError(f"Missing local profiling script: {script_path}")
+
+    with tempfile.TemporaryDirectory(prefix="sou-local-profile-") as tmp_dir:
+        out_dir = Path(tmp_dir) / "out"
+        scratch_dir = Path(tmp_dir) / "scratch"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        scratch_dir.mkdir(parents=True, exist_ok=True)
+
+        env = os.environ.copy()
+        env["OUT"] = str(out_dir)
+        env["SCRATCH"] = str(scratch_dir)
+
+        logger.info("Starting local profiling using '%s'", script_path)
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=timeout_seconds,
+        )
+        if result.stderr.strip():
+            logger.debug(result.stderr.strip())
+
+        json_files = sorted(out_dir.glob("*.rich.json"))
+        if not json_files:
+            raise FileNotFoundError(
+                "Local profiling did not produce any *.rich.json file"
+            )
+        with open(json_files[0], encoding="utf-8") as f:
+            data = json.load(f)
+
+        local_profile = {
+            "node": str(data.get("node", "local")),
+            "cpu_score": float(data["cpu_events_s"]),
+            "io_score": float(data["io_score"]),
+        }
+        logger.info("Local profiling results: %s", local_profile)
+        return local_profile
+
+
 def run_remote_profiling(
     kube_contexts: list[str],
     manifest_dir: Path,
     namespace: str,
     timeout_seconds: int,
+    local_profile: dict[str, float] | None = None,
 ) -> None:
     daemonset_manifest = manifest_dir / "lotaru-g-daemonset.yaml"
     collector_manifest = manifest_dir / "lotaru-g-results-pod.yaml"
@@ -447,8 +499,31 @@ def run_remote_profiling(
             ]
         )
 
+    context_nodes: dict[str, list[str]] = {}
     for context in kube_contexts:
+        node_text = run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "get",
+                "nodes",
+                "-o",
+                'jsonpath={range .items[*]}{.metadata.name}{"\\n"}{end}',
+            ]
+        )
+        nodes = [line.strip() for line in node_text.splitlines() if line.strip()]
+        if not nodes:
+            raise RuntimeError(f"No nodes found in context '{context}'")
+        context_nodes[context] = nodes
+
+    for context in kube_contexts:
+        nodes = context_nodes[context]
         logger.info("Clearing previous profiling results in context '%s'", context)
+        rich_paths = " ".join(
+            shlex.quote(f"/results/lotaru-benchmark/{node}.rich.json") for node in nodes
+        )
+        csv_path = shlex.quote(f"/results/lotaru-benchmark/lotaru-g-{context}.csv")
         run_checked(
             [
                 "kubectl",
@@ -461,7 +536,7 @@ def run_remote_profiling(
                 "--",
                 "sh",
                 "-c",
-                "rm -f /results/lotaru-benchmark/*.rich.json /results/lotaru-benchmark/lotaru-g.csv",
+                f"rm -f {rich_paths} {csv_path}",
             ]
         )
 
@@ -506,37 +581,100 @@ def run_remote_profiling(
         )
 
     for context in kube_contexts:
+        nodes = context_nodes[context]
         deadline = time.monotonic() + timeout_seconds
-        csv = ""
+        rows: list[dict[str, float | str]] = []
+
         while time.monotonic() < deadline:
-            try:
-                csv = run_checked(
-                    [
-                        "kubectl",
-                        "--context",
-                        context,
-                        "-n",
-                        namespace,
-                        "exec",
-                        "lotaru-benchmark-results",
-                        "--",
-                        "cat",
-                        "/results/lotaru-benchmark/lotaru-g.csv",
-                    ]
+            rows = []
+            missing = []
+            for node in nodes:
+                try:
+                    raw = run_checked(
+                        [
+                            "kubectl",
+                            "--context",
+                            context,
+                            "-n",
+                            namespace,
+                            "exec",
+                            "lotaru-benchmark-results",
+                            "--",
+                            "cat",
+                            f"/results/lotaru-benchmark/{node}.rich.json",
+                        ]
+                    )
+                    data = json.loads(raw)
+                except (subprocess.CalledProcessError, json.JSONDecodeError):
+                    missing.append(node)
+                    continue
+
+                rows.append(
+                    {
+                        "node": data.get("node", node),
+                        "cpu_score": data.get("cpu_events_s", ""),
+                        "io_score": data.get("io_score", ""),
+                        "contention_score": data.get("contention_score", ""),
+                    }
                 )
-            except subprocess.CalledProcessError as error:
-                logger.debug("CSV not ready yet: %s", error)
-                time.sleep(5)
-                continue
-            if len(csv.strip().splitlines()) > 1:
+
+            if not missing and rows:
                 break
             time.sleep(5)
         else:
             raise TimeoutError(
-                f"No profiling results found for context '{context}' within {timeout_seconds}s"
+                f"No complete profiling results found for context '{context}' within {timeout_seconds}s"
             )
 
+        # Build context-local CSV from expected node files only.
+        csv_lines = ["node,cpu_score,io_score,contention_score"]
+        for row in sorted(rows, key=lambda r: str(r["node"])):
+            csv_lines.append(
+                f"{row['node']},{row['cpu_score']},{row['io_score']},{row['contention_score']}"
+            )
+        csv = "\n".join(csv_lines)
+
+        csv_target = f"/results/lotaru-benchmark/lotaru-g-{context}.csv"
+        write_cmd = f"cat > {shlex.quote(csv_target)} <<'EOF'\n{csv}\nEOF"
+        run_checked(
+            [
+                "kubectl",
+                "--context",
+                context,
+                "-n",
+                namespace,
+                "exec",
+                "lotaru-benchmark-results",
+                "--",
+                "sh",
+                "-c",
+                write_cmd,
+            ]
+        )
+
         logger.info("Profiling results for '%s':\n%s", context, csv.strip())
+        logger.info(
+            "Wrote context-local profiling CSV for '%s' to %s", context, csv_target
+        )
+        ratios = sou.scheduler.Scheduler.compute_node_performance_ratios_from_csv(csv)
+        if ratios:
+            logger.info("Node performance ratios for '%s': %s", context, ratios)
+
+        if local_profile is not None:
+            local_remote_ratios = (
+                sou.scheduler.Scheduler.compute_local_to_remote_ratios_from_csv(
+                    local_profile["cpu_score"],
+                    local_profile["io_score"],
+                    csv,
+                )
+            )
+            if local_remote_ratios:
+                logger.info(
+                    "Local-vs-remote ratios for '%s' (local node '%s'): %s",
+                    context,
+                    local_profile["node"],
+                    local_remote_ratios,
+                )
 
         logger.info("Cleaning up profiling pods in context '%s'", context)
         run_checked(
@@ -610,6 +748,11 @@ def run_cli(argv: list[str]):
         help="profile configured Kubernetes clusters with Lotaru-G and print the CSV results",
     )
     parser.add_argument(
+        "--local-profiling",
+        action="store_true",
+        help="profile the local laptop with Lotaru-G and optionally compute local-vs-remote ratios",
+    )
+    parser.add_argument(
         "--kube-context",
         dest="kube_contexts",
         action="append",
@@ -620,6 +763,11 @@ def run_cli(argv: list[str]):
         "--profiling-manifest-dir",
         default=str(default_profiling_manifest_dir()),
         help="directory containing Lotaru-G Kubernetes manifests",
+    )
+    parser.add_argument(
+        "--local-profiling-script",
+        default=str(default_local_profiling_script()),
+        help="path to local Lotaru-G profiling script",
     )
     parser.add_argument(
         "--profiling-namespace",
@@ -646,22 +794,32 @@ def run_cli(argv: list[str]):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if args.remote_profiling:
-        if not args.kube_contexts:
+    if args.remote_profiling or args.local_profiling:
+        if args.remote_profiling and not args.kube_contexts:
             parser.error("--remote-profiling requires at least one --kube-context")
+
+        local_profile = None
         try:
-            run_remote_profiling(
-                args.kube_contexts,
-                Path(args.profiling_manifest_dir),
-                args.profiling_namespace,
-                args.profiling_timeout_seconds,
-            )
+            if args.local_profiling:
+                local_profile = run_local_profiling(
+                    Path(args.local_profiling_script),
+                    args.profiling_timeout_seconds,
+                )
+
+            if args.remote_profiling:
+                run_remote_profiling(
+                    args.kube_contexts,
+                    Path(args.profiling_manifest_dir),
+                    args.profiling_namespace,
+                    args.profiling_timeout_seconds,
+                    local_profile=local_profile,
+                )
         except subprocess.CalledProcessError as error:
             message = (error.stderr or error.stdout or str(error)).strip()
-            logger.error("Remote profiling failed: %s", message)
+            logger.error("Profiling failed: %s", message)
             return error.returncode
-        except (FileNotFoundError, TimeoutError) as error:
-            logger.error("Remote profiling failed: %s", error)
+        except (FileNotFoundError, TimeoutError, subprocess.TimeoutExpired) as error:
+            logger.error("Profiling failed: %s", error)
             return 1
         return 0
 

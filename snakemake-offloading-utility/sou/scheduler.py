@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import csv
 import json
 import logging
 import sys
@@ -31,6 +32,9 @@ class Node:
     available_cores: int
     available_mem_mb: float
     available_disk_mb: float
+    cpu_score: float | None
+    io_score: float | None
+    performance_ratio: float | None
 
     def __init__(self, name, cores, mem_mb, disk_mb):
         self.name = name
@@ -40,6 +44,9 @@ class Node:
         self.available_cores = cores
         self.available_mem_mb = mem_mb
         self.available_disk_mb = disk_mb
+        self.cpu_score = None
+        self.io_score = None
+        self.performance_ratio = None
 
     def check_if_scheduling_possible(self, cores, mem_mb, disk_mb):
         if self.cores < cores:
@@ -123,6 +130,10 @@ class Scheduler:
         self.secondary_cluster = secondary_cluster
         self.max_parallel_jobs = parallel_jobs
         self.prices = prices  # in $, secondary cluster
+        self.node_benchmark_scores: dict[str, dict[str, float]] = {}
+        self.node_performance_ratios: dict[str, float] = {}
+        self.local_benchmark_score: dict[str, float] = {}
+        self.local_to_remote_ratios: dict[str, float] = {}
 
         self.jobids_to_files = self.dryrun.get_job_files()
         self.dag.annotate_nodes_with_files(self.jobids_to_files)
@@ -141,6 +152,147 @@ class Scheduler:
             json.dump(self.predictions_wall_time, f, indent=4)
         with open(Path(".sou/latest_predictions_runtime.json"), "w") as f:
             json.dump(self.predictions_runtime, f, indent=4)
+
+    @staticmethod
+    def compute_node_performance_ratios_from_csv(
+        benchmark_csv: str,
+    ) -> dict[str, float]:
+        """
+        Compute per-node performance ratios from a lotaru-g CSV.
+
+        Weighted score per node: 0.5 * cpu_score + 0.5 * io_score
+        Fastest node gets ratio 1.0; slower nodes get lower ratios.
+        """
+        weighted_scores: dict[str, float] = {}
+        for row in csv.DictReader(benchmark_csv.splitlines()):
+            node_name = row.get("node")
+            if not node_name:
+                continue
+            try:
+                cpu_score = float(row["cpu_score"])
+                io_score = float(row["io_score"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            weighted_scores[node_name] = 0.5 * cpu_score + 0.5 * io_score
+
+        if not weighted_scores:
+            return {}
+
+        best_score = max(weighted_scores.values())
+        if best_score <= 0:
+            return {}
+
+        ratios = {
+            node_name: score / best_score
+            for node_name, score in weighted_scores.items()
+        }
+        logger.info("Computed node performance ratios (best=1.0): %s", ratios)
+        return ratios
+
+    @staticmethod
+    def compute_local_to_remote_ratios_from_csv(
+        local_cpu_score: float,
+        local_io_score: float,
+        benchmark_csv: str,
+    ) -> dict[str, float]:
+        """
+        Compute local-vs-remote ratios per node from a lotaru-g CSV.
+
+        Ratio per remote node = 0.5 * (local_cpu / remote_cpu)
+                              + 0.5 * (local_io / remote_io)
+        """
+        ratios: dict[str, float] = {}
+        for row in csv.DictReader(benchmark_csv.splitlines()):
+            node_name = row.get("node")
+            if not node_name:
+                continue
+            try:
+                remote_cpu = float(row["cpu_score"])
+                remote_io = float(row["io_score"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if remote_cpu <= 0 or remote_io <= 0:
+                continue
+
+            ratios[node_name] = 0.5 * (local_cpu_score / remote_cpu) + 0.5 * (
+                local_io_score / remote_io
+            )
+
+        logger.info("Computed local-vs-remote ratios: %s", ratios)
+        return ratios
+
+    def update_local_to_remote_ratios(
+        self,
+        local_cpu_score: float,
+        local_io_score: float,
+        benchmark_csv: str,
+    ) -> dict[str, float]:
+        self.local_benchmark_score = {
+            "cpu_score": local_cpu_score,
+            "io_score": local_io_score,
+        }
+        self.local_to_remote_ratios = self.compute_local_to_remote_ratios_from_csv(
+            local_cpu_score,
+            local_io_score,
+            benchmark_csv,
+        )
+        return self.local_to_remote_ratios
+
+    def update_node_performance_ratios(self, benchmark_csv: str) -> dict[str, float]:
+        """
+        Update node benchmark scores from a lotaru-g CSV and compute per-node
+        performance ratios for all configured cluster nodes.
+
+        Weighted score per node: 0.5 * cpu_score + 0.5 * io_score
+        Fastest node gets ratio 1.0; slower nodes get lower ratios.
+        """
+        by_name = {
+            node.name: node
+            for node in self.primary_cluster.nodes + self.secondary_cluster.nodes
+        }
+        weighted_scores: dict[str, float] = {}
+        self.node_benchmark_scores = {}
+
+        for row in csv.DictReader(benchmark_csv.splitlines()):
+            node_name = row.get("node")
+            if not node_name or node_name not in by_name:
+                continue
+            try:
+                cpu_score = float(row["cpu_score"])
+                io_score = float(row["io_score"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            node = by_name[node_name]
+            node.cpu_score = cpu_score
+            node.io_score = io_score
+            weighted_scores[node_name] = 0.5 * cpu_score + 0.5 * io_score
+            self.node_benchmark_scores[node_name] = {
+                "cpu_score": cpu_score,
+                "io_score": io_score,
+            }
+
+        if not weighted_scores:
+            self.node_performance_ratios = {}
+            return {}
+
+        best_score = max(weighted_scores.values())
+        if best_score <= 0:
+            self.node_performance_ratios = {}
+            return {}
+
+        self.node_performance_ratios = {
+            node_name: score / best_score
+            for node_name, score in weighted_scores.items()
+        }
+        for node_name, ratio in self.node_performance_ratios.items():
+            by_name[node_name].performance_ratio = ratio
+
+        logger.info(
+            "Computed node performance ratios (best=1.0): %s",
+            self.node_performance_ratios,
+        )
+        return self.node_performance_ratios
 
     def _get_node_of_job(self, jobid: int) -> Node | None:
         primary_nodes = self.primary_cluster.nodes
