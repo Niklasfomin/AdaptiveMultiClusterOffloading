@@ -52,7 +52,31 @@ class SnakemakeLog:
         job_end_times = {}
         current_timestamp = None
 
-        file_pattern = r"[^\s()]+(?=\s*\([^()]*\)\s*(?:,|$))"
+        def _parse_paths(line, prefix):
+            payload = line[len(prefix) :].strip()
+            if not payload:
+                return []
+
+            items = []
+            for part in payload.split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # old logs append notes like "(retrieve from storage)"
+                part = re.sub(r"\s*\([^()]*\)\s*$", "", part).strip()
+                if not part:
+                    continue
+                items.append(remove_storage_prefix(part))
+            return items
+
+        def _parse_single_path(line, prefix):
+            payload = line[len(prefix) :].strip()
+            if not payload:
+                return None
+            payload = re.sub(r"\s*\([^()]*\)\s*$", "", payload).strip()
+            if not payload:
+                return None
+            return remove_storage_prefix(payload)
 
         for line in self.log_text.splitlines():
             line = line.strip()
@@ -75,24 +99,16 @@ class SnakemakeLog:
                 }
 
             elif line.startswith("input:"):
-                inputs = re.findall(file_pattern, line)
-                inputs = [remove_storage_prefix(f.strip()) for f in inputs]
-                current_job_files["input"] = inputs
+                current_job_files["input"] = _parse_paths(line, "input:")
 
             elif line.startswith("output:"):
-                outputs = re.findall(file_pattern, line)
-                outputs = [remove_storage_prefix(f.strip()) for f in outputs]
-                current_job_files["output"] = outputs
+                current_job_files["output"] = _parse_paths(line, "output:")
 
             elif line.startswith("log:"):
-                logs = re.findall(file_pattern, line)
-                logs = [remove_storage_prefix(f.strip()) for f in logs]
-                current_job_files["log"] = logs
+                current_job_files["log"] = _parse_paths(line, "log:")
 
             elif line.startswith("benchmark:"):
-                benchmark = re.match(r"benchmark:\s+(\S+)\s+\(", line).group(1)
-                benchmark = remove_storage_prefix(benchmark.strip())
-                current_job_files["benchmark"] = benchmark
+                current_job_files["benchmark"] = _parse_single_path(line, "benchmark:")
 
             elif line.startswith("jobid:"):
                 jobid = line.split(":", 1)[1].strip()

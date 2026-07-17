@@ -27,6 +27,7 @@ from textual.widgets import (
 
 import sou.scheduler
 from sou.helpers import (
+    get_config,
     get_snakemake_params,
     run_command,
     set_snakemake_params,
@@ -349,6 +350,18 @@ def parse_enum(enum_cls, value: str):
     for item in enum_cls:
         if value in {item.name, item.value}:
             return item
+
+    if enum_cls is OffloadingStrategy:
+        aliases = {
+            "none": OffloadingStrategy.NONE,
+            "pefo": OffloadingStrategy.PRIMARY_OCCUPIED,
+            "ljf": OffloadingStrategy.LONGEST_JOB_FIRST,
+            "sisf": OffloadingStrategy.SMALLEST_INPUT_SIZE_FIRST,
+        }
+        alias_match = aliases.get(value.lower())
+        if alias_match:
+            return alias_match
+
     choices = ", ".join(item.value for item in enum_cls)
     raise argparse.ArgumentTypeError(
         f"invalid value '{value}'. Choose one of: {choices}"
@@ -388,7 +401,16 @@ def default_local_profiling_script() -> Path:
     return Path(__file__).resolve().parents[2] / "py-lotaru" / "lotaru-g.sh"
 
 
-def run_local_profiling(script_path: Path, timeout_seconds: int) -> dict[str, float]:
+def default_remote_profiling_cache_file() -> Path:
+    return Path(".sou") / "latest_remote_profiling.csv"
+
+
+def run_local_profiling(
+    script_path: Path,
+    timeout_seconds: int,
+    full_scores: bool = False,
+    contention: bool = False,
+) -> dict[str, float]:
     if not script_path.exists():
         raise FileNotFoundError(f"Missing local profiling script: {script_path}")
 
@@ -402,9 +424,20 @@ def run_local_profiling(script_path: Path, timeout_seconds: int) -> dict[str, fl
         env["OUT"] = str(out_dir)
         env["SCRATCH"] = str(scratch_dir)
 
-        logger.info("Starting local profiling using '%s'", script_path)
+        logger.info(
+            "Starting local profiling using '%s' (scores_full=%s, contention=%s)",
+            script_path,
+            full_scores,
+            contention,
+        )
+        script_command = ["bash", str(script_path)]
+        if contention:
+            script_command.append("--contention")
+        if full_scores:
+            script_command.append("--scores-full")
+
         result = subprocess.run(
-            ["bash", str(script_path)],
+            script_command,
             check=True,
             text=True,
             stdout=subprocess.PIPE,
@@ -427,9 +460,30 @@ def run_local_profiling(script_path: Path, timeout_seconds: int) -> dict[str, fl
             "node": str(data.get("node", "local")),
             "cpu_score": float(data["cpu_events_s"]),
             "io_score": float(data["io_score"]),
+            "memory_score": float(data.get("memory_score", data.get("ram_score", 0.0))),
+            "network_score_mbps": float(data.get("network_score_mbps", 0.0)),
         }
         logger.info("Local profiling results: %s", local_profile)
         return local_profile
+
+
+def configured_network_peer_map() -> str:
+    clusters = (get_config() or {}).get("clusters", {})
+    peer_map: list[str] = []
+
+    for cluster_name, cluster in clusters.items():
+        nodes = cluster.get("nodes", [])
+        if len(nodes) < 2:
+            raise ValueError(
+                f"Cluster '{cluster_name}' needs at least two nodes for network profiling"
+            )
+        for index, node in enumerate(nodes):
+            peer = nodes[(index + 1) % len(nodes)]
+            peer_map.append(f'{node["name"]}={peer["ip_address"]}')
+
+    if not peer_map:
+        raise ValueError("No cluster nodes configured for network profiling")
+    return ",".join(peer_map)
 
 
 def run_remote_profiling(
@@ -438,7 +492,22 @@ def run_remote_profiling(
     namespace: str,
     timeout_seconds: int,
     local_profile: dict[str, float] | None = None,
-) -> None:
+    cache_file: Path | None = None,
+    use_cached: bool = False,
+    full_scores: bool = False,
+    contention: bool = False,
+    network_peer_map: str | None = None,
+) -> str:
+    if use_cached and cache_file is not None and cache_file.exists():
+        cached_csv = cache_file.read_text(encoding="utf-8").strip()
+        if cached_csv:
+            logger.info("Using cached profiling CSV from '%s'", cache_file)
+            return cached_csv
+        logger.warning(
+            "Cached profiling CSV '%s' is empty; collecting fresh profiling data",
+            cache_file,
+        )
+
     daemonset_manifest = manifest_dir / "lotaru-g-daemonset.yaml"
     collector_manifest = manifest_dir / "lotaru-g-results-pod.yaml"
     missing = [
@@ -450,6 +519,65 @@ def run_remote_profiling(
         raise FileNotFoundError(
             "Missing profiling manifest(s): " + ", ".join(str(path) for path in missing)
         )
+
+    daemonset_manifest_to_apply = daemonset_manifest
+    if full_scores or contention:
+        if full_scores and not network_peer_map:
+            raise ValueError(
+                "--scores-full requires peer IP addresses in the SOU node config"
+            )
+
+        daemonset_content = daemonset_manifest.read_text(encoding="utf-8")
+        flags = " ".join(
+            flag
+            for enabled, flag in [
+                (contention, "--contention"),
+                (full_scores, "--scores-full"),
+            ]
+            if enabled
+        )
+        daemonset_content = daemonset_content.replace(
+            "lotaru-g.sh &&", f"lotaru-g.sh {flags} &&", 1
+        )
+
+        lines = daemonset_content.splitlines()
+        volume_mounts_index = next(
+            (i for i, line in enumerate(lines) if line.strip() == "volumeMounts:"),
+            None,
+        )
+        if full_scores:
+            peer_map_block = [
+                "            - name: NET_HOST_MAP",
+                f'              value: "{network_peer_map}"',
+            ]
+            if volume_mounts_index is not None:
+                lines[volume_mounts_index:volume_mounts_index] = peer_map_block
+            else:
+                lines.extend(peer_map_block)
+
+        daemonset_content = "\n".join(lines) + "\n"
+
+        enabled_features = "-".join(
+            feature
+            for enabled, feature in [
+                (contention, "contention"),
+                (full_scores, "scores-full"),
+            ]
+            if enabled
+        )
+        patched_manifest = Path(".sou") / f"lotaru-g-daemonset.{enabled_features}.yaml"
+        patched_manifest.parent.mkdir(parents=True, exist_ok=True)
+        patched_manifest.write_text(daemonset_content, encoding="utf-8")
+        daemonset_manifest_to_apply = patched_manifest
+        logger.info(
+            "Using patched daemonset manifest (contention=%s, scores_full=%s, NET_HOST_MAP=%s): %s",
+            contention,
+            full_scores,
+            network_peer_map,
+            daemonset_manifest_to_apply,
+        )
+
+    combined_rows_by_node: dict[str, dict[str, float | str]] = {}
 
     for context in kube_contexts:
         logger.info("Ensuring result collector exists in context '%s'", context)
@@ -551,7 +679,7 @@ def run_remote_profiling(
                 namespace,
                 "apply",
                 "-f",
-                str(daemonset_manifest),
+                str(daemonset_manifest_to_apply),
             ]
         )
         run_checked(
@@ -614,6 +742,8 @@ def run_remote_profiling(
                         "node": data.get("node", node),
                         "cpu_score": data.get("cpu_events_s", ""),
                         "io_score": data.get("io_score", ""),
+                        "memory_score": data.get("memory_score", data.get("ram_score", "")),
+                        "network_score_mbps": data.get("network_score_mbps", ""),
                         "contention_score": data.get("contention_score", ""),
                     }
                 )
@@ -627,10 +757,10 @@ def run_remote_profiling(
             )
 
         # Build context-local CSV from expected node files only.
-        csv_lines = ["node,cpu_score,io_score,contention_score"]
+        csv_lines = ["node,cpu_score,io_score,memory_score,network_score_mbps,contention_score"]
         for row in sorted(rows, key=lambda r: str(r["node"])):
             csv_lines.append(
-                f"{row['node']},{row['cpu_score']},{row['io_score']},{row['contention_score']}"
+                f"{row['node']},{row['cpu_score']},{row['io_score']},{row['memory_score']},{row['network_score_mbps']},{row['contention_score']}"
             )
         csv = "\n".join(csv_lines)
 
@@ -656,9 +786,22 @@ def run_remote_profiling(
         logger.info(
             "Wrote context-local profiling CSV for '%s' to %s", context, csv_target
         )
-        ratios = sou.scheduler.Scheduler.compute_node_performance_ratios_from_csv(csv)
-        if ratios:
-            logger.info("Node performance ratios for '%s': %s", context, ratios)
+        factors = sou.scheduler.Scheduler.compute_node_runtime_factors_from_csv(csv)
+        if factors:
+            logger.info("Node runtime factors for '%s': %s", context, factors)
+
+        for row in rows:
+            node_name = str(row.get("node", "")).strip()
+            if not node_name:
+                continue
+            combined_rows_by_node[node_name] = {
+                "node": node_name,
+                "cpu_score": row.get("cpu_score", ""),
+                "io_score": row.get("io_score", ""),
+                "memory_score": row.get("memory_score", ""),
+                "network_score_mbps": row.get("network_score_mbps", ""),
+                "contention_score": row.get("contention_score", ""),
+            }
 
         if local_profile is not None:
             local_remote_ratios = (
@@ -690,6 +833,22 @@ def run_remote_profiling(
                 "--ignore-not-found=true",
             ]
         )
+
+    combined_csv_lines = ["node,cpu_score,io_score,memory_score,network_score_mbps,contention_score"]
+    for node in sorted(combined_rows_by_node):
+        row = combined_rows_by_node[node]
+        combined_csv_lines.append(
+            f"{row['node']},{row['cpu_score']},{row['io_score']},{row['memory_score']},{row['network_score_mbps']},{row['contention_score']}"
+        )
+    combined_csv = "\n".join(combined_csv_lines)
+
+    if cache_file is not None:
+        cache_file.parent.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(combined_csv + "\n", encoding="utf-8")
+        logger.info("Saved combined profiling CSV cache to '%s'", cache_file)
+
+    logger.info("Combined profiling CSV across contexts:\n%s", combined_csv)
+    return combined_csv
 
 
 def run_tui(snakemake_args: list[str]):
@@ -736,6 +895,7 @@ def run_cli(argv: list[str]):
         "--offloading-strategy",
         default=OffloadingStrategy.NONE.value,
         type=lambda value: parse_enum(OffloadingStrategy, value),
+        help="offloading strategy (also accepts short codes: none, pefo, ljf, sisf)",
     )
     parser.add_argument(
         "--profiling-environment",
@@ -780,6 +940,27 @@ def run_cli(argv: list[str]):
         default=900,
         help="maximum time to wait for profiling CSV results per context",
     )
+    parser.add_argument(
+        "--contention",
+        action="store_true",
+        help="run profiling with additional contended benchmarks and contention metrics",
+    )
+    parser.add_argument(
+        "--scores-full",
+        action="store_true",
+        help="run profiling in full-score mode (includes memory_score and network_score_mbps)",
+    )
+
+    parser.add_argument(
+        "--profiling-cache-file",
+        default=str(default_remote_profiling_cache_file()),
+        help="path to cached combined remote profiling CSV",
+    )
+    parser.add_argument(
+        "--use-cached-profiling",
+        action="store_true",
+        help="reuse cached profiling CSV instead of rerunning remote profiling benchmarks",
+    )
 
     if snakemake_args is None:
         args, snakemake_args = parser.parse_known_args(sou_args)
@@ -794,9 +975,13 @@ def run_cli(argv: list[str]):
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    if args.remote_profiling or args.local_profiling:
-        if args.remote_profiling and not args.kube_contexts:
-            parser.error("--remote-profiling requires at least one --kube-context")
+    benchmark_csv = None
+    profiling_cache_file = Path(args.profiling_cache_file)
+    if args.remote_profiling or args.local_profiling or args.use_cached_profiling:
+        if args.remote_profiling and not args.kube_contexts and not args.use_cached_profiling:
+            parser.error("--remote-profiling requires at least one --kube-context (unless --use-cached-profiling is set)")
+
+
 
         local_profile = None
         try:
@@ -804,24 +989,49 @@ def run_cli(argv: list[str]):
                 local_profile = run_local_profiling(
                     Path(args.local_profiling_script),
                     args.profiling_timeout_seconds,
+                    full_scores=args.scores_full,
+                    contention=args.contention,
                 )
 
             if args.remote_profiling:
-                run_remote_profiling(
+                benchmark_csv = run_remote_profiling(
                     args.kube_contexts,
                     Path(args.profiling_manifest_dir),
                     args.profiling_namespace,
                     args.profiling_timeout_seconds,
                     local_profile=local_profile,
+                    cache_file=profiling_cache_file,
+                    use_cached=args.use_cached_profiling,
+                    full_scores=args.scores_full,
+                    contention=args.contention,
+                    network_peer_map=(
+                        configured_network_peer_map() if args.scores_full else None
+                    ),
+                )
+            elif args.use_cached_profiling:
+                if not profiling_cache_file.exists():
+                    parser.error(
+                        f"cached profiling file not found: {profiling_cache_file}. Run with --remote-profiling once or provide --profiling-cache-file."
+                    )
+                benchmark_csv = profiling_cache_file.read_text(encoding="utf-8").strip()
+                if not benchmark_csv:
+                    parser.error(
+                        f"cached profiling file is empty: {profiling_cache_file}."
+                    )
+                logger.info(
+                    "Using cached profiling CSV from '%s'", profiling_cache_file
                 )
         except subprocess.CalledProcessError as error:
             message = (error.stderr or error.stdout or str(error)).strip()
             logger.error("Profiling failed: %s", message)
             return error.returncode
-        except (FileNotFoundError, TimeoutError, subprocess.TimeoutExpired) as error:
+        except (FileNotFoundError, TimeoutError, subprocess.TimeoutExpired, ValueError, KeyError) as error:
             logger.error("Profiling failed: %s", error)
             return 1
-        return 0
+
+        # profiling-only mode
+        if not args.runs_dir and not snakemake_args:
+            return 0
 
     if not snakemake_args:
         parser.error("missing Snakemake arguments; pass them after '--'")
@@ -840,12 +1050,12 @@ def run_cli(argv: list[str]):
         print(f"Command: '{command}'")
         return run_command(command, live=True)
 
-    if args.profiling_environment in {
-        ProfilingEnvironment.LOCAL,
-        ProfilingEnvironment.REMOTE,
-    }:
+    if (
+        args.profiling_environment == ProfilingEnvironment.REMOTE
+        and benchmark_csv is None
+    ):
         parser.error(
-            "selected profiling environment is not supported for CLI execution"
+            "profiling environment 'REMOTE' requires --remote-profiling (or --use-cached-profiling) when running prediction in CLI mode"
         )
 
     deadline_seconds = args.deadline_minutes * 60 if args.deadline_minutes else None
@@ -865,6 +1075,7 @@ def run_cli(argv: list[str]):
         args.offloading_strategy,
         args.profiling_environment,
         args.corr_threshold,
+        benchmark_csv,
     )
     if not result:
         return 1

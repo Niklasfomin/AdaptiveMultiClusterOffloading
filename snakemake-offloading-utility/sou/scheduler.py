@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from statistics import median
+from typing import cast
 
 from sou.helpers import (
     get_config,
@@ -34,10 +35,15 @@ class Node:
     available_disk_mb: float
     cpu_score: float | None
     io_score: float | None
-    performance_ratio: float | None
+    mem_score: float | None
+    net_score: float | None
+    contention_score: float | None
+    runtime_factor: float | None
+    ip_address: str
 
-    def __init__(self, name, cores, mem_mb, disk_mb):
+    def __init__(self, name, cores, mem_mb, disk_mb, ip_address):
         self.name = name
+        self.ip_address = ip_address
         self.cores = cores
         self.mem_mb = mem_mb
         self.disk_mb = disk_mb
@@ -46,7 +52,10 @@ class Node:
         self.available_disk_mb = disk_mb
         self.cpu_score = None
         self.io_score = None
-        self.performance_ratio = None
+        self.mem_score = None
+        self.net_score = None
+        self.contention_score = None
+        self.runtime_factor = None
 
     def check_if_scheduling_possible(self, cores, mem_mb, disk_mb):
         if self.cores < cores:
@@ -131,9 +140,10 @@ class Scheduler:
         self.max_parallel_jobs = parallel_jobs
         self.prices = prices  # in $, secondary cluster
         self.node_benchmark_scores: dict[str, dict[str, float]] = {}
-        self.node_performance_ratios: dict[str, float] = {}
+        self.node_runtime_factors: dict[str, float] = {}
         self.local_benchmark_score: dict[str, float] = {}
         self.local_to_remote_ratios: dict[str, float] = {}
+        self.last_offloaded_effective_runtime_per_job: dict[int, float] = {}
 
         self.jobids_to_files = self.dryrun.get_job_files()
         self.dag.annotate_nodes_with_files(self.jobids_to_files)
@@ -154,104 +164,134 @@ class Scheduler:
             json.dump(self.predictions_runtime, f, indent=4)
 
     @staticmethod
-    def compute_node_performance_ratios_from_csv(
+    def compute_contention_slowdown(contention_score: float, weight: float) -> float:
+            # raw score: 1.0 = no performance loss, 0.5 = half performance remains
+            c = min(max(contention_score, 0.1), 1.0)
+
+            # weight: 0 = ignore contention, 1 = apply full contention effect
+            w = min(max(weight, 0.0), 1.0)
+
+            # transform retained performance into runtime slowdown
+            return 1.0 + w * ((1.0 / c) - 1.0)
+
+    # TODO: Add dynamic and bounded weighting to these scores, e.g. based on the workflow's resource requirements and the node's benchmark scores
+    @staticmethod
+    def compute_node_runtime_factors_from_csv(
         benchmark_csv: str,
     ) -> dict[str, float]:
         """
-        Compute per-node performance ratios from a lotaru-g CSV.
-
-        Weighted score per node: 0.5 * cpu_score + 0.5 * io_score
-        Fastest node gets ratio 1.0; slower nodes get lower ratios.
+        Fastest node gets factor 1.0; slower nodes get larger factors.
         """
-        weighted_scores: dict[str, float] = {}
+        def optional_float(row: dict[str, str], *names: str) -> float | None:
+            for name in names:
+                value = row.get(name)
+                if value not in (None, ""):
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return None
+            return None
+
+        scores: list[dict[str, str | float | None]] = []
         for row in csv.DictReader(benchmark_csv.splitlines()):
             node_name = row.get("node")
-            if not node_name:
-                continue
             try:
                 cpu_score = float(row["cpu_score"])
                 io_score = float(row["io_score"])
             except (KeyError, TypeError, ValueError):
                 continue
-            weighted_scores[node_name] = 0.5 * cpu_score + 0.5 * io_score
+            if not node_name or cpu_score <= 0 or io_score <= 0:
+                continue
+            scores.append(
+                {
+                    "node": node_name,
+                    "cpu": cpu_score,
+                    "io": io_score,
+                    "mem": optional_float(row, "memory_score", "mem_score"),
+                    "net": optional_float(row, "network_score_mbps", "net_score"),
+                    "contention": optional_float(row, "contention_score"),
+                }
+            )
 
-        if not weighted_scores:
+        if not scores:
             return {}
+
+        maxima = {
+            metric: max(
+                cast(float, score[metric])
+                for score in scores
+                if score[metric] is not None
+                and cast(float, score[metric]) > 0
+            )
+            for metric in ("cpu", "io")
+        }
+        for metric in ("mem", "net"):
+            values = [
+                cast(float, score[metric])
+                for score in scores
+                if score[metric] is not None
+                and cast(float, score[metric]) > 0
+            ]
+            maxima[metric] = max(values) if values else 0.0
+
+        weighted_scores: dict[str, float] = {}
+        for score in scores:
+            cpu = cast(float, score["cpu"]) / maxima["cpu"]
+            io = cast(float, score["io"]) / maxima["io"]
+            has_extended_scores = (
+                score["mem"] is not None
+                and score["net"] is not None
+                and score["contention"] is not None
+                and maxima["mem"] > 0
+                and maxima["net"] > 0
+            )
+            if has_extended_scores:
+                base_score = (
+                    0.3 * cpu
+                    + 0.3 * io
+                    + 0.2 * (cast(float, score["mem"]) / maxima["mem"])
+                    + 0.2 * (cast(float, score["net"]) / maxima["net"])
+                )
+                weighted_score = base_score / Scheduler.compute_contention_slowdown(
+                    cast(float, score["contention"]), weight=0.5
+                )
+            else:
+                weighted_score = 0.5 * cpu + 0.5 * io
+            weighted_scores[str(score["node"])] = weighted_score
 
         best_score = max(weighted_scores.values())
         if best_score <= 0:
             return {}
 
-        ratios = {
-            node_name: score / best_score
+        factors = {
+            node_name: best_score / score
             for node_name, score in weighted_scores.items()
+            if score > 0
         }
-        logger.info("Computed node performance ratios (best=1.0): %s", ratios)
-        return ratios
+        logger.info("Computed node runtime factors (best=1.0): %s", factors)
+        return factors
 
-    @staticmethod
-    def compute_local_to_remote_ratios_from_csv(
-        local_cpu_score: float,
-        local_io_score: float,
-        benchmark_csv: str,
-    ) -> dict[str, float]:
+    def update_node_runtime_factors(self, benchmark_csv: str) -> dict[str, float]:
         """
-        Compute local-vs-remote ratios per node from a lotaru-g CSV.
+        Update node benchmark scores and compute runtime multipliers.
 
-        Ratio per remote node = 0.5 * (local_cpu / remote_cpu)
-                              + 0.5 * (local_io / remote_io)
-        """
-        ratios: dict[str, float] = {}
-        for row in csv.DictReader(benchmark_csv.splitlines()):
-            node_name = row.get("node")
-            if not node_name:
-                continue
-            try:
-                remote_cpu = float(row["cpu_score"])
-                remote_io = float(row["io_score"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if remote_cpu <= 0 or remote_io <= 0:
-                continue
-
-            ratios[node_name] = 0.5 * (local_cpu_score / remote_cpu) + 0.5 * (
-                local_io_score / remote_io
-            )
-
-        logger.info("Computed local-vs-remote ratios: %s", ratios)
-        return ratios
-
-    def update_local_to_remote_ratios(
-        self,
-        local_cpu_score: float,
-        local_io_score: float,
-        benchmark_csv: str,
-    ) -> dict[str, float]:
-        self.local_benchmark_score = {
-            "cpu_score": local_cpu_score,
-            "io_score": local_io_score,
-        }
-        self.local_to_remote_ratios = self.compute_local_to_remote_ratios_from_csv(
-            local_cpu_score,
-            local_io_score,
-            benchmark_csv,
-        )
-        return self.local_to_remote_ratios
-
-    def update_node_performance_ratios(self, benchmark_csv: str) -> dict[str, float]:
-        """
-        Update node benchmark scores from a lotaru-g CSV and compute per-node
-        performance ratios for all configured cluster nodes.
-
-        Weighted score per node: 0.5 * cpu_score + 0.5 * io_score
-        Fastest node gets ratio 1.0; slower nodes get lower ratios.
+        The fastest node gets factor 1.0; slower nodes get larger factors.
         """
         by_name = {
             node.name: node
             for node in self.primary_cluster.nodes + self.secondary_cluster.nodes
         }
-        weighted_scores: dict[str, float] = {}
         self.node_benchmark_scores = {}
+
+        def optional_score(row: dict[str, str], *names: str) -> float | None:
+            for name in names:
+                value = row.get(name)
+                if value not in (None, ""):
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return None
+            return None
 
         for row in csv.DictReader(benchmark_csv.splitlines()):
             node_name = row.get("node")
@@ -266,33 +306,28 @@ class Scheduler:
             node = by_name[node_name]
             node.cpu_score = cpu_score
             node.io_score = io_score
-            weighted_scores[node_name] = 0.5 * cpu_score + 0.5 * io_score
+            node.mem_score = optional_score(row, "memory_score", "mem_score")
+            node.net_score = optional_score(row, "network_score_mbps", "net_score")
+            node.contention_score = optional_score(row, "contention_score")
             self.node_benchmark_scores[node_name] = {
                 "cpu_score": cpu_score,
                 "io_score": io_score,
             }
 
-        if not weighted_scores:
-            self.node_performance_ratios = {}
-            return {}
-
-        best_score = max(weighted_scores.values())
-        if best_score <= 0:
-            self.node_performance_ratios = {}
-            return {}
-
-        self.node_performance_ratios = {
-            node_name: score / best_score
-            for node_name, score in weighted_scores.items()
+        computed_factors = self.compute_node_runtime_factors_from_csv(benchmark_csv)
+        self.node_runtime_factors = {
+            node_name: factor
+            for node_name, factor in computed_factors.items()
+            if node_name in by_name
         }
-        for node_name, ratio in self.node_performance_ratios.items():
-            by_name[node_name].performance_ratio = ratio
+        for node_name, factor in self.node_runtime_factors.items():
+            by_name[node_name].runtime_factor = factor
 
         logger.info(
-            "Computed node performance ratios (best=1.0): %s",
-            self.node_performance_ratios,
+            "Computed node runtime factors (best=1.0): %s",
+            self.node_runtime_factors,
         )
-        return self.node_performance_ratios
+        return self.node_runtime_factors
 
     def _get_node_of_job(self, jobid: int) -> Node | None:
         primary_nodes = self.primary_cluster.nodes
@@ -364,21 +399,39 @@ class Scheduler:
                         return node.name, True
             return None, False
 
+    def extrapolate_runtime_prediction(self, jobid: int, node_name: str) -> float:
+        if node_name in self.node_runtime_factors:
+            runtime_factor = self.node_runtime_factors[node_name]
+            if runtime_factor is not None and runtime_factor > 0:
+                return self.predictions[jobid] * runtime_factor
+        logger.warning(
+            f"Node {node_name} has no valid runtime factor, using original prediction for job {jobid}"
+        )
+        return self.predictions[jobid]
+
     def predict_workflow_runtime(
         self,
         offloading_strategy: OffloadingStrategy = OffloadingStrategy.NONE,
         deadline=None,
+        profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
     ):
         if offloading_strategy in [
             OffloadingStrategy.PRIMARY_OCCUPIED,
             OffloadingStrategy.NONE,
         ]:
-            latest_runtime_estimate, offloaded_jobs, _ = self.simulate_workflow_run(
-                offloading_strategy
+            latest_runtime_estimate, offloaded_jobs, _, offloaded_effective_runtime_per_job = self.simulate_workflow_run(
+                offloading_strategy,
+                profiling_environment=profiling_environment,
             )
+            self.last_offloaded_effective_runtime_per_job = offloaded_effective_runtime_per_job.copy()
+
         else:
             latest_runtime_estimate, offloaded_jobs = (
-                self.simulate_approaching_deadline(offloading_strategy, deadline)
+                self.simulate_approaching_deadline(
+                    offloading_strategy,
+                    deadline,
+                    profiling_environment=profiling_environment,
+                )
             )
         offloaded_jobs = {
             jobid: self.dag.get_rule_by_jobid(jobid) for jobid in offloaded_jobs
@@ -386,10 +439,28 @@ class Scheduler:
         return latest_runtime_estimate, offloaded_jobs
 
     def simulate_approaching_deadline(
-        self, offloading_strategy: OffloadingStrategy, deadline: float
+        self,
+        offloading_strategy: OffloadingStrategy,
+        deadline: float,
+        profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
     ):
         if offloading_strategy == OffloadingStrategy.LONGEST_JOB_FIRST:
-            if offloading_strategy == Offloa
+            if profiling_environment == ProfilingEnvironment.REMOTE:
+                sort_deferred_func = lambda j: max(
+                    (
+                        self.extrapolate_runtime_prediction(j, node.name)
+                        for node in self.secondary_cluster.nodes
+                        if node.check_if_scheduling_possible(
+                            self.dryrun.get_requested_resources(j).get("threads", 1),
+                            self.dryrun.get_requested_resources(j).get("mem_mb", 0),
+                            self.dryrun.get_requested_resources(j).get("disk_mb", 0),
+                        )
+                    ),
+                    default=self.predictions[j],
+                )
+            else:
+                sort_deferred_func = lambda j: self.predictions[j]
+
         elif offloading_strategy == OffloadingStrategy.SMALLEST_INPUT_SIZE_FIRST:
             sort_deferred_func = lambda j: get_total_input_size(
                 self.dag.get_initial_input_files_ancestors(j),
@@ -401,9 +472,15 @@ class Scheduler:
         simulation_counter = 1
         logger.info(f"Starting simulation run {simulation_counter}")
 
-        latest_runtime_estimate, offloaded_jobs, deferred_jobs = (
-            self.simulate_workflow_run(offloading_strategy)
+        latest_runtime_estimate, offloaded_jobs, deferred_jobs, offloaded_effective_runtime_per_job = (
+            self.simulate_workflow_run(
+                offloading_strategy,
+                profiling_environment=profiling_environment,
+            )
         )
+        offloaded_effective_runtime_minimum = offloaded_effective_runtime_per_job.copy()
+
+
         # log_approaching_deadline(latest_runtime_estimate, len(offloaded_jobs), offloading_strategy.name)
 
         if latest_runtime_estimate <= deadline:
@@ -427,9 +504,11 @@ class Scheduler:
                     logger.info(
                         f"Offloading these jobs: {offloaded_jobs | {next_to_offload}}"
                     )
-                    latest_runtime_estimate, offloaded_jobs, deferred_jobs = (
+                    latest_runtime_estimate, offloaded_jobs, deferred_jobs, offloaded_effective_runtime_per_job = (
                         self.simulate_workflow_run(
-                            offloading_strategy, offloaded_jobs | {next_to_offload}
+                            offloading_strategy,
+                            profiling_environment=profiling_environment,
+                            jobs_to_offload=offloaded_jobs | {next_to_offload},
                         )
                     )
                     # log_approaching_deadline(latest_runtime_estimate, len(offloaded_jobs), offloading_strategy.name)
@@ -437,6 +516,7 @@ class Scheduler:
                     if latest_runtime_estimate < minimum_runtime_estimate:
                         minimum_runtime_estimate = latest_runtime_estimate
                         offloaded_jobs_minimum_estimate = offloaded_jobs.copy()
+                        offloaded_effective_runtime_minimum = offloaded_effective_runtime_per_job.copy()
                     else:
                         logger.warning(
                             f"Offloading job {next_to_offload} did not improve runtime estimate"
@@ -447,15 +527,21 @@ class Scheduler:
                     logger.info(
                         f"Latest runtime estimate ({latest_runtime_estimate} s) was not minimal ({minimum_runtime_estimate} s), select jobs to offload according to minimum runtime estimate"
                     )
+                    self.last_offloaded_effective_runtime_per_job = offloaded_effective_runtime_minimum.copy()
                     return minimum_runtime_estimate, offloaded_jobs_minimum_estimate
             logger.info(f"Deadline met.")
+            self.last_offloaded_effective_runtime_per_job = offloaded_effective_runtime_minimum.copy()
+
             return minimum_runtime_estimate, offloaded_jobs_minimum_estimate
 
     def simulate_workflow_run(
         self,
         offloading_strategy: OffloadingStrategy,
+        profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
         jobs_to_offload: set[int] | None = None,
     ):
+        effective_runtime_per_job = {}
+        offloaded_effective_runtime_per_job = {}
         job_queue = deque()
         job_queue_deferred = deque()
         running_jobs = {}
@@ -482,9 +568,16 @@ class Scheduler:
                 if node:
                     logger.debug(f"Job {jobid} -> {node}")
                     self.dag.set_cluster_node(jobid, node)
-                    running_jobs[jobid] = self.predictions[jobid]
+                    # TODO: Here is where extrapolation based on node performance ratios is applied to the runtime prediction
+                    effective = (self.extrapolate_runtime_prediction(jobid, node)
+                        if profiling_environment == ProfilingEnvironment.REMOTE
+                        else self.predictions[jobid]
+                    )
+                    running_jobs[jobid] = effective
+                    effective_runtime_per_job[jobid] = effective
                     if is_offloaded:
                         logger.debug(f"Job {jobid} offloaded")
+                        offloaded_effective_runtime_per_job[jobid] = effective
                         all_offloaded_jobs.add(jobid)
                 else:
                     logger.debug(f"No node available for job {jobid}, defer...")
@@ -516,7 +609,8 @@ class Scheduler:
 
         self.dag.reset()
         logger.info(f"Workflow simulation run completed, overall time: {timer} s")
-        return timer, all_offloaded_jobs, all_deferred_jobs
+        self.last_offloaded_effective_runtime_per_job = offloaded_effective_runtime_per_job.copy()
+        return timer, all_offloaded_jobs, all_deferred_jobs, offloaded_effective_runtime_per_job
 
     def get_time_predictions(self, model_name: str):
         predictions = {}
@@ -568,6 +662,7 @@ class Scheduler:
             )
         return predictions
 
+    # TODO: It might still operate on base runtimes and not on extrapolated runtimes, which would be more accurate
     def _calculate_cost(
         self,
         runtime: float,
@@ -584,9 +679,11 @@ class Scheduler:
     def predict_offloading_cost(self, offloaded_jobs: set[int]):
         total_cost = 0
         for jobid in offloaded_jobs:
+            runtime = self.last_offloaded_effective_runtime_per_job.get(jobid, self.predictions[jobid])
             # defaults for resources are taken from AWS Fargate: 1 vCPU, 2 GB RAM, 20 GB disk
             total_cost += self._calculate_cost(
-                self.predictions[jobid],
+                runtime if runtime is not None else 0.0,
+
                 self.dryrun.get_requested_resources(jobid).get("threads", 1),
                 self.dryrun.get_requested_resources(jobid).get("mem_mb", 2000),
                 self.dryrun.get_requested_resources(jobid).get("disk_mb", 20000),
@@ -610,7 +707,8 @@ def create_node(node_config: dict) -> Node:
     cores = node_config["cores"]
     mem_mb = node_config["mem_gb"] * 1000
     disk_mb = node_config["disk_gb"] * 1000
-    return Node(name, cores, mem_mb, disk_mb)
+    ip_address = node_config["ip_address"]
+    return Node(name, cores, mem_mb, disk_mb, ip_address)
 
 
 def create_clusters(cluster_config: dict) -> tuple[Cluster, Cluster]:
@@ -630,6 +728,7 @@ def main(
     offloading_strategy: OffloadingStrategy = OffloadingStrategy.NONE,
     profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
     corr_threshold: float = 0.8,
+    benchmark_csv: str | None = None,
 ):
     setup_logging()
 
@@ -642,8 +741,19 @@ def main(
     scheduler = Scheduler(
         dag, dryrun, predictor, primary_cluster, secondary_cluster, prices
     )
+
+    if profiling_environment == ProfilingEnvironment.REMOTE:
+        if benchmark_csv:
+            scheduler.update_node_runtime_factors(benchmark_csv)
+        else:
+            logger.warning(
+                "Profiling environment is REMOTE but no benchmark CSV was provided; falling back to base predictions."
+            )
+
     runtime, offloaded_jobs = scheduler.predict_workflow_runtime(
-        offloading_strategy, deadline
+        offloading_strategy,
+        deadline,
+        profiling_environment=profiling_environment,
     )
     cost = scheduler.predict_offloading_cost(set(offloaded_jobs.keys()))
 
@@ -664,6 +774,7 @@ def run_main_safely(
     offloading_strategy: OffloadingStrategy,
     profiling_environment: ProfilingEnvironment,
     corr_threshold: float,
+    benchmark_csv: str | None = None,
 ):
     try:
         return main(
@@ -672,6 +783,7 @@ def run_main_safely(
             offloading_strategy,
             profiling_environment,
             corr_threshold,
+            benchmark_csv,
         )
     except Exception as e:
         logger.exception("An error occurred during workflow prediction:")

@@ -17,6 +17,7 @@ logger = logging.getLogger("sou")
 
 
 class Predictor:
+    # Prediction always works based on multiple runs for reproducability
     def __init__(self, base_dir: str, corr_threshold: float):
         self.corr_threshold = corr_threshold
         logger.info(f"Correlation threshold set to {self.corr_threshold:.2f}")
@@ -28,6 +29,7 @@ class Predictor:
         self.base_path = base_path
         self.runs = collect_benchmark_files_of_all_runs(self.base_path)
         collect_benchmarks_per_rule(self.runs)
+        # TODO: Add function to compute the primary input sizes without combining them
         compute_ancestor_input_sizes(self.runs)
 
         self.datapoints_by_rule = get_datapoints_by_rule(self.runs)
@@ -52,6 +54,7 @@ class Predictor:
             }
         return models
 
+    # TODO: Add the bayesian model implementation here when done
     def predict(self, model_name: str, rule_name: str, input_size: float):
         if rule_name not in self.models:
             logger.warning(f"Rule '{rule_name}' not found in models")
@@ -84,9 +87,9 @@ class Predictor:
             return None
 
     def fit_model(self, x_values, y_values):
-        assert len(x_values) == len(
-            y_values
-        ), "x and y values must have the same length"
+        assert len(x_values) == len(y_values), (
+            "x and y values must have the same length"
+        )
         if len(x_values) == 0:
             logger.warning("No data points to fit model")
             return

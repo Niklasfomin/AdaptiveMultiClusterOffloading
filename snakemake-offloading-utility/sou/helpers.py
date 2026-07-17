@@ -70,18 +70,23 @@ def get_snakemake_params() -> str:
 
 
 def remove_storage_prefix(path: str) -> str:
+    if path is None:
+        return path
+
+    path = str(path).strip()
     snakemake_pattern = r"^\.snakemake/storage/[^/]+/"
     protocol_pattern = r"^\w+://"
     local_pattern = r"workflow/"
+
     if re.match(snakemake_pattern, path):
         return re.sub(snakemake_pattern, "", path)
-    elif re.match(protocol_pattern, path):
+    if re.match(protocol_pattern, path):
         return re.sub(protocol_pattern, "", path)
-    elif re.search(local_pattern, path):
-        return path.split("workflow/")[1]
-    else:
-        logger.warning(f"Path doesn't match expected storage prefix: {path}")
-        return str(path)
+    if re.search(local_pattern, path):
+        return path.split("workflow/", 1)[1]
+
+    # Plain local relative/absolute paths are valid; keep unchanged.
+    return path
 
 
 def get_local_file_sizes(paths: list[str]) -> dict[str, float]:

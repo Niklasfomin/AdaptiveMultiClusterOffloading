@@ -52,11 +52,19 @@ def collect_benchmark_files_of_all_runs(base_path: Path) -> list[Run]:
 
         run = Run(run_name=run_path.name, run_path=run_path, rules=defaultdict(list))
         for bm_file in benchmarks_path.iterdir():
-            if "+" not in bm_file.name or "_copied" == bm_file.name:
+            if bm_file.is_dir() or not bm_file.name.endswith(".tsv"):
                 continue
-            rule_name = bm_file.name.split("+")[
-                0
-            ]  # convention: rule_name followed by '+'
+            if bm_file.name == "_copied":
+                continue
+
+            # Historical naming: <rule>+<wildcards>.tsv
+            if "+" in bm_file.name:
+                rule_name = bm_file.name.split("+")[0]
+            else:
+                # Newer flattened naming (e.g. rules_star_align_T01_1.tsv).
+                # We will resolve the final rule robustly in collect_benchmarks_per_rule.
+                rule_name = "unknown"
+
             run.rules[rule_name].append(Datapoint(bm_file))
 
         runs.append(run)
@@ -67,11 +75,13 @@ def collect_benchmarks_per_rule(runs: list[Run]):
     for run in runs:
         logger.info(f"Reading benchmark files from '{run.run_path}'")
         snakemake_log = SnakemakeLog(run.run_path / "snakemake.log")
-        for rule_name, datapoints in run.rules.items():
+
+        resolved_rules = defaultdict(list)
+        for fallback_rule_name, datapoints in run.rules.items():
             for dp in datapoints:
                 try:
-                    runtime, total_input_size, input_size_dict = process_benchmark_file(
-                        dp.filepath
+                    runtime, total_input_size, input_size_dict, benchmark_rule_name = (
+                        process_benchmark_file(dp.filepath)
                     )
                     dp.runtime = runtime
                     dp.total_input_size = total_input_size
@@ -83,8 +93,19 @@ def collect_benchmarks_per_rule(runs: list[Run]):
                     )
                     # due to a snakemake bug, the jobid in the benchmark file is always set to 0
                     dp.jobid = snakemake_log.get_jobid_by_benchmark(dp.filepath.name)
+
+                    rule_from_log = None
+                    if dp.jobid and snakemake_log.jobs_to_files.get(dp.jobid):
+                        rule_from_log = snakemake_log.jobs_to_files[dp.jobid].get("rule")
+
+                    resolved_rule_name = (
+                        benchmark_rule_name or rule_from_log or fallback_rule_name
+                    )
+                    resolved_rules[resolved_rule_name].append(dp)
                 except Exception as e:
                     logger.error(f"Error processing benchmark file {dp.filepath}: {e}")
+
+        run.rules = resolved_rules
 
 
 def compute_ancestor_input_sizes(runs: list[Run]):
@@ -185,7 +206,16 @@ def process_benchmark_file(filepath):
     runtime = float(df["s"].iloc[0])
     input_size_dict = ast.literal_eval(df["input_size_mb"].iloc[0])
     total_input_size = sum(input_size_dict.values())
-    return runtime, total_input_size, input_size_dict
+
+    rule_name = None
+    if "rule_name" in df.columns:
+        candidate = df["rule_name"].iloc[0]
+        if not pd.isna(candidate):
+            candidate = str(candidate).strip()
+            if candidate:
+                rule_name = candidate
+
+    return runtime, total_input_size, input_size_dict, rule_name
 
 
 def preprocess_benchmarks_dir(benchmark_path: Path):

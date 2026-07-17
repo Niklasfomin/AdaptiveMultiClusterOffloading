@@ -1,21 +1,25 @@
 clusters:
   primary:
     nodes:
-      - name: node1
+      - name: siena06
+        ip_address: 130.149.248.105
         cores: 32
         mem_gb: 125
         disk_gb: 1024
-      - name: node2
+      - name: cpu06
+        ip_address: 130.149.248.62
         cores: 32
         mem_gb: 125
         disk_gb: 1024
   secondary:
     nodes:
-      - name: node3
+      - name: cpu10
+        ip_address: 130.149.248.66
         cores: 32
         mem_gb: 125
         disk_gb: 1024
-      - name: node4
+      - name: gpu06
+        ip_address: 130.149.248.55
         cores: 32
         mem_gb: 125
         disk_gb: 1024
