@@ -4,8 +4,10 @@ import json
 import logging
 import os
 import re
+import sys
 from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -18,18 +20,41 @@ from sklearn.metrics import PredictionErrorDisplay
 
 logger = logging.getLogger()
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SOU_INPUT_MODE = "ancestor"  # aligns with SOU scheduler predictions (apriori models)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SOU_PATH = REPO_ROOT / "snakemake-offloading-utility"
+if str(SOU_PATH) not in sys.path:
+    sys.path.insert(0, str(SOU_PATH))
+
+from sou.snakemake_benchmarks import (  # noqa: E402
+    collect_benchmark_files_of_all_runs,
+    collect_benchmarks_per_rule,
+    compute_ancestor_input_sizes,
+)
 
 
 def remove_storage_prefix(path: str) -> str:
-    snakemake_pattern = r"^\.snakemake/storage/[^/]+/"
-    protocol_pattern = r"^\w+://"
-    if re.match(snakemake_pattern, path):
-        return re.sub(snakemake_pattern, "", path)
-    elif re.match(protocol_pattern, path):
-        return re.sub(protocol_pattern, "", path)
-    else:
-        logger.warning(f"Path doesn't match expected storage prefix: {path}")
+    """Normalize path strings from benchmark/log records.
+
+    Handles both historical remote-storage paths and current local absolute/relative
+    paths without emitting warnings for normal local paths.
+    """
+    if path is None:
         return path
+
+    p = path.strip()
+
+    # Historical Snakemake log formatting occasionally appends notes like
+    # "(send to storage)". Remove if present.
+    p = re.sub(r"\s*\([^()]*\)\s*$", "", p)
+
+    # Snakemake local storage cache prefix.
+    p = re.sub(r"^\.snakemake/storage/[^/]+/", "", p)
+
+    # URI scheme prefix (ftp://, s3://, file://, ...).
+    p = re.sub(r"^\w+://", "", p)
+
+    return p
 
 
 def read_log(log_file_path):
@@ -50,7 +75,30 @@ def parse_log(log_text):
     job_end_times = {}
     current_timestamp = None
 
-    file_pattern = r"[^\s()]+(?=\s*\([^()]*\)\s*(?:,|$))"
+    def _parse_paths(line, prefix):
+        payload = line[len(prefix) :].strip()
+        if not payload:
+            return []
+        items = []
+        for part in payload.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            # remove trailing notes like "(send to storage)" used in older logs
+            part = re.sub(r"\s*\([^()]*\)\s*$", "", part).strip()
+            if not part:
+                continue
+            items.append(remove_storage_prefix(part))
+        return items
+
+    def _parse_single_path(line, prefix):
+        payload = line[len(prefix) :].strip()
+        if not payload:
+            return None
+        payload = re.sub(r"\s*\([^()]*\)\s*$", "", payload).strip()
+        if not payload:
+            return None
+        return remove_storage_prefix(payload)
 
     for line in log_text.splitlines():
         line = line.strip()
@@ -73,24 +121,16 @@ def parse_log(log_text):
             }
 
         elif line.startswith("input:"):
-            inputs = re.findall(file_pattern, line)
-            inputs = [remove_storage_prefix(f.strip()) for f in inputs]
-            current_job_files["input"] = inputs
+            current_job_files["input"] = _parse_paths(line, "input:")
 
         elif line.startswith("output:"):
-            outputs = re.findall(file_pattern, line)
-            outputs = [remove_storage_prefix(f.strip()) for f in outputs]
-            current_job_files["output"] = outputs
+            current_job_files["output"] = _parse_paths(line, "output:")
 
         elif line.startswith("log:"):
-            logs = re.findall(file_pattern, line)
-            logs = [remove_storage_prefix(f.strip()) for f in logs]
-            current_job_files["log"] = logs
+            current_job_files["log"] = _parse_paths(line, "log:")
 
         elif line.startswith("benchmark:"):
-            benchmark = re.match(r"benchmark:\s+(\S+)\s+\(", line).group(1)
-            benchmark = remove_storage_prefix(benchmark.strip())
-            current_job_files["benchmark"] = benchmark
+            current_job_files["benchmark"] = _parse_single_path(line, "benchmark:")
 
         elif line.startswith("jobid:"):
             jobid = line.split(":", 1)[1].strip()
@@ -283,98 +323,323 @@ def reconstruct_dag(jobs_to_files):
     return graph
 
 
-def read_benchmark_input_sizes(path):
+def read_benchmark_record(path):
     df = pd.read_csv(path, sep="\t")
     runtime = float(df["s"].iloc[0])
     input_sizes = ast.literal_eval(df["input_size_mb"].iloc[0])
     input_sizes = {remove_storage_prefix(k): v for k, v in input_sizes.items()}
+
+    rule_name = None
+    if "rule_name" in df.columns:
+        candidate = df["rule_name"].iloc[0]
+        if not pd.isna(candidate):
+            candidate = str(candidate).strip()
+            if candidate:
+                rule_name = candidate
+
+    return runtime, input_sizes, rule_name
+
+
+def read_benchmark_input_sizes(path):
+    runtime, input_sizes, _ = read_benchmark_record(path)
     return runtime, input_sizes
 
 
-def collect_stained_glass_input_size_rows(training_dir):
-    rows = []
-    omitted = defaultdict(lambda: defaultdict(int))
+def _normalize_benchmark_ref(benchmark_ref):
+    if not benchmark_ref:
+        return None
 
-    for run_dir in resolve_training_runs(training_dir):
-        run_name = os.path.basename(run_dir)
-        benchmark_dir = os.path.join(run_dir, "benchmarks")
-        log_path = os.path.join(run_dir, "snakemake.log")
-        if not os.path.isdir(benchmark_dir) or not os.path.exists(log_path):
+    ref = remove_storage_prefix(benchmark_ref).replace("\\", "/").strip()
+    if "benchmarks/" in ref:
+        ref = ref.split("benchmarks/", 1)[1]
+    ref = ref.lstrip("./")
+    return ref or None
+
+
+def resolve_benchmark_file_path(benchmark_dir, benchmark_ref):
+    rel_ref = _normalize_benchmark_ref(benchmark_ref)
+    if not rel_ref:
+        return None
+
+    rel_no_ext = os.path.splitext(rel_ref)[0]
+    candidates = []
+
+    for rel in (rel_ref, rel_no_ext):
+        if not rel:
             continue
 
-        _, jobs_to_files = parse_log(read_log(log_path))
-        initial_inputs = get_initial_input_files(jobs_to_files)
-        dag = reconstruct_dag(jobs_to_files)
+        if os.path.splitext(rel)[1]:
+            candidates.append(os.path.join(benchmark_dir, rel))
+        else:
+            candidates.append(os.path.join(benchmark_dir, f"{rel}.tsv"))
 
-        job_input_sizes = {}
+        flattened = rel.replace("/", "_")
+        if os.path.splitext(flattened)[1]:
+            candidates.append(os.path.join(benchmark_dir, flattened))
+        else:
+            candidates.append(os.path.join(benchmark_dir, f"{flattened}.tsv"))
+
+        base = os.path.basename(rel)
+        if os.path.splitext(base)[1]:
+            candidates.append(os.path.join(benchmark_dir, base))
+        else:
+            candidates.append(os.path.join(benchmark_dir, f"{base}.tsv"))
+
+    seen = set()
+    for candidate in candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.exists(candidate):
+            return candidate
+
+    return None
+
+
+def iter_benchmark_tsv_paths(benchmark_dir):
+    benchmark_paths = []
+    for root, _, files in os.walk(benchmark_dir):
+        for filename in files:
+            if filename.endswith(".tsv"):
+                benchmark_paths.append(os.path.join(root, filename))
+    return sorted(benchmark_paths)
+
+
+def build_benchmark_rule_lookup(log_path):
+    lookup = defaultdict(set)
+    if not os.path.exists(log_path):
+        return lookup
+
+    _, jobs_to_files = parse_log(read_log(log_path))
+    for files in jobs_to_files.values():
+        benchmark_ref = files.get("benchmark")
+        rule = files.get("rule")
+        rel_ref = _normalize_benchmark_ref(benchmark_ref)
+        if not rel_ref or not rule:
+            continue
+
+        rel_stem = os.path.splitext(rel_ref)[0]
+        candidates = {
+            rel_ref,
+            rel_stem,
+            rel_ref.replace("/", "_"),
+            rel_stem.replace("/", "_"),
+            os.path.basename(rel_ref),
+            os.path.basename(rel_stem),
+        }
+        for candidate in candidates:
+            if candidate:
+                lookup[candidate].add(rule)
+
+    return lookup
+
+
+def _lookup_unique_rule(rule_lookup, key):
+    rules = rule_lookup.get(key)
+    if not rules or len(rules) != 1:
+        return None
+    return next(iter(rules))
+
+
+def infer_rule_for_benchmark(benchmark_path, benchmark_dir, rule_name=None, rule_lookup=None):
+    if rule_name:
+        return rule_name
+
+    if rule_lookup is None:
+        rule_lookup = {}
+
+    rel = os.path.relpath(benchmark_path, benchmark_dir).replace("\\", "/")
+    rel_stem = os.path.splitext(rel)[0]
+    basename = os.path.basename(rel)
+    stem = os.path.splitext(basename)[0]
+
+    keys = (
+        rel,
+        rel_stem,
+        rel.replace("/", "_"),
+        rel_stem.replace("/", "_"),
+        basename,
+        stem,
+    )
+    for key in keys:
+        rule = _lookup_unique_rule(rule_lookup, key)
+        if rule:
+            return rule
+
+    if "+" in stem:
+        return stem.split("+", 1)[0]
+
+    return stem
+
+
+def _collect_run_benchmark_records(run_dir, benchmark_dir):
+    """Collect benchmark-backed records for one run.
+
+    Prefers benchmark references from `snakemake.log` (stable job linkage).
+    Falls back to scanning benchmark TSV files when needed.
+    """
+    log_path = os.path.join(run_dir, "snakemake.log")
+    rule_lookup = build_benchmark_rule_lookup(log_path)
+    jobs_to_files = {}
+    records = []
+
+    if os.path.exists(log_path):
+        _, jobs_to_files = parse_log(read_log(log_path))
         for jobid, files in jobs_to_files.items():
             benchmark = files.get("benchmark")
-            if not benchmark:
+            benchmark_path = resolve_benchmark_file_path(benchmark_dir, benchmark)
+            if not benchmark_path:
                 continue
-            benchmark_name = benchmark.split("benchmarks/")[-1].replace("/", "_")
-            benchmark_path = os.path.join(benchmark_dir, benchmark_name)
-            if not os.path.exists(benchmark_path):
+
+            try:
+                runtime, input_sizes, rule_name = read_benchmark_record(benchmark_path)
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping unreadable benchmark file '{benchmark_path}': {exc}"
+                )
                 continue
-            runtime, input_sizes = read_benchmark_input_sizes(benchmark_path)
-            job_input_sizes[jobid] = input_sizes
-            rule = files["rule"]
 
-            total_size = sum(input_sizes.values())
-            primary_size = sum(
-                size for path, size in input_sizes.items() if path in initial_inputs
-            )
+            rule = files.get("rule") or rule_name
+            if not rule:
+                rule = infer_rule_for_benchmark(
+                    benchmark_path,
+                    benchmark_dir,
+                    rule_name=rule_name,
+                    rule_lookup=rule_lookup,
+                )
 
-            rows.append(
+            records.append(
                 {
-                    "mode": "total",
+                    "jobid": jobid,
                     "rule": rule,
-                    "input_size_mb": total_size,
                     "runtime_s": runtime,
+                    "input_sizes": input_sizes,
                 }
             )
-            if primary_size > 0:
-                rows.append(
-                    {
-                        "mode": "primary",
-                        "rule": rule,
-                        "input_size_mb": primary_size,
-                        "runtime_s": runtime,
-                    }
-                )
-            else:
-                omitted["primary"][rule] += 1
 
-        all_known_sizes = {}
-        for input_sizes in job_input_sizes.values():
-            all_known_sizes.update(input_sizes)
+    if records:
+        return records, jobs_to_files
 
-        for jobid, input_sizes in job_input_sizes.items():
-            rule = jobs_to_files[jobid]["rule"]
-            benchmark = jobs_to_files[jobid].get("benchmark")
-            benchmark_name = benchmark.split("benchmarks/")[-1].replace("/", "_")
-            runtime, _ = read_benchmark_input_sizes(
-                os.path.join(benchmark_dir, benchmark_name)
+    # Fallback path for runs without usable log benchmark references.
+    for benchmark_path in iter_benchmark_tsv_paths(benchmark_dir):
+        try:
+            runtime, input_sizes, rule_name = read_benchmark_record(benchmark_path)
+        except Exception as exc:
+            logger.warning(
+                f"Skipping unreadable benchmark file '{benchmark_path}': {exc}"
             )
-            ancestor_jobs = nx.ancestors(dag, jobid)
-            ancestor_jobs.add(jobid)
-            ancestor_inputs = set()
-            for ancestor in ancestor_jobs:
-                ancestor_inputs.update(jobs_to_files[ancestor].get("input", []))
-            primary_ancestor_inputs = ancestor_inputs & initial_inputs
-            ancestor_size = sum(
-                all_known_sizes.get(path, 0) for path in primary_ancestor_inputs
-            )
-            if ancestor_size > 0:
-                rows.append(
-                    {
-                        "mode": "ancestor",
-                        "rule": rule,
-                        "input_size_mb": ancestor_size,
-                        "runtime_s": runtime,
-                    }
-                )
-            else:
-                omitted["ancestor"][rule] += 1
+            continue
+
+        rule = infer_rule_for_benchmark(
+            benchmark_path,
+            benchmark_dir,
+            rule_name=rule_name,
+            rule_lookup=rule_lookup,
+        )
+        records.append(
+            {
+                "jobid": None,
+                "rule": rule,
+                "runtime_s": runtime,
+                "input_sizes": input_sizes,
+            }
+        )
+
+    return records, jobs_to_files
+
+
+def _compute_ancestor_input_size(record, dag, initial_input_files, input_file_sizes):
+    """Compute ancestor-based input size for one job record.
+
+    Returns tuple: (input_size_mb | None, missing_file_count)
+    """
+    jobid = record.get("jobid")
+    if jobid is None or dag is None or jobid not in dag:
+        return None, 0
+
+    ancestor_jobs = nx.ancestors(dag, jobid)
+    ancestor_jobs.add(jobid)
+
+    ancestor_input_files = set()
+    for ancestor_jobid in ancestor_jobs:
+        ancestor_input_files.update(dag.nodes[ancestor_jobid].get("input", set()))
+
+    initial_ancestor_input_files = ancestor_input_files & initial_input_files
+
+    total_initial_input_size_ancestors = 0.0
+    missing_count = 0
+    for file_path in initial_ancestor_input_files:
+        size = input_file_sizes.get(file_path)
+        if size is None:
+            missing_count += 1
+            continue
+        total_initial_input_size_ancestors += size
+
+    return total_initial_input_size_ancestors, missing_count
+
+
+def collect_stained_glass_input_size_rows(
+    training_dir, single_run=False, modes=("total",)
+):
+    """Collect per-job runtime and input-size rows using sou.snakemake_benchmarks."""
+    rows = []
+    omitted = defaultdict(lambda: defaultdict(int))
+    modes = tuple(dict.fromkeys(modes)) if modes else ("total",)
+
+    run_dirs = [Path(p).resolve() for p in resolve_training_runs(training_dir)]
+    if single_run:
+        run_dirs = run_dirs[:1]
+    if not run_dirs:
+        return pd.DataFrame(rows), omitted
+
+    selected_runs = set(run_dirs)
+    runs = []
+    run_parents = sorted({run_dir.parent for run_dir in run_dirs})
+    for parent in run_parents:
+        parent_runs = collect_benchmark_files_of_all_runs(parent)
+        runs.extend(
+            run for run in parent_runs if run.run_path.resolve() in selected_runs
+        )
+
+    if not runs:
+        return pd.DataFrame(rows), omitted
+
+    collect_benchmarks_per_rule(runs)
+    if "ancestor" in modes:
+        compute_ancestor_input_sizes(runs)
+
+    for run in runs:
+        run_name = run.run_name
+        for rule, datapoints in run.rules.items():
+            for dp in datapoints:
+                runtime_s = dp.runtime
+                if runtime_s is None:
+                    for mode in modes:
+                        omitted[mode][rule] += 1
+                    continue
+
+                for mode in modes:
+                    if mode == "total":
+                        input_size_mb = dp.total_input_size
+                    elif mode == "ancestor":
+                        input_size_mb = dp.total_initial_input_size_ancestors
+                    else:
+                        omitted[mode][rule] += 1
+                        continue
+
+                    if input_size_mb is None:
+                        omitted[mode][rule] += 1
+                        continue
+
+                    rows.append(
+                        {
+                            "mode": mode,
+                            "rule": rule,
+                            "input_size_mb": input_size_mb,
+                            "runtime_s": runtime_s,
+                            "run": run_name,
+                        }
+                    )
 
     return pd.DataFrame(rows), omitted
 
@@ -390,6 +655,30 @@ def resolve_training_runs(path):
         for name in os.listdir(path)
         if os.path.isdir(os.path.join(path, name, "benchmarks"))
     )
+
+
+def source_label_from_path(path):
+    """Create a stable label for output filenames from an input path."""
+    abs_path = os.path.abspath(path)
+    if os.path.isfile(abs_path):
+        abs_path = os.path.dirname(abs_path)
+
+    label = os.path.basename(abs_path.rstrip(os.sep)) or "data"
+    label = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")
+    return label or "data"
+
+
+def input_size_descriptor(mode="total"):
+    labels = {
+        "total": "total input size",
+        "primary": "primary input size",
+        "ancestor": "ancestor input size",
+    }
+    return labels.get(mode, f"{mode} input size")
+
+
+def input_size_axis_label(mode="total"):
+    return f"{input_size_descriptor(mode).capitalize()} [MB]"
 
 
 def calculate_correlations(rule_df, methods):
@@ -412,11 +701,19 @@ def calculate_correlations(rule_df, methods):
     return correlations
 
 
-def format_correlation_title(correlations):
+def format_correlation_title(correlations, threshold=None):
     labels = []
     for method, corr in correlations.items():
         short = "p" if method == "pearson" else "s"
-        labels.append(f"{short}=n/a" if corr is None else f"{short}={corr:.2f}")
+        if corr is None:
+            labels.append(f"{short}=n/a")
+            continue
+
+        if threshold is None:
+            labels.append(f"{short}={corr:.3f}")
+        else:
+            mark = "✓" if corr >= threshold else "✗"
+            labels.append(f"{short}={corr:.3f} {mark}")
     return ", ".join(labels)
 
 
@@ -434,6 +731,7 @@ def plot_direct_input_correlation(
     path,
     workflow="stained-glass",
     single_run=False,
+    input_mode=SOU_INPUT_MODE,
     corr_methods=("pearson",),
     corr_threshold=0.8,
 ):
@@ -443,27 +741,26 @@ def plot_direct_input_correlation(
     if not run_dirs:
         raise ValueError(f"No training runs found at {path}")
 
-    rows = []
-    for run_dir in run_dirs:
-        benchmark_dir = os.path.join(run_dir, "benchmarks")
-        for filename in sorted(os.listdir(benchmark_dir)):
-            if "+" not in filename or not filename.endswith(".tsv"):
-                continue
-            rule = filename.split("+", 1)[0]
-            runtime, input_sizes = read_benchmark_input_sizes(
-                os.path.join(benchmark_dir, filename)
-            )
-            rows.append(
-                {
-                    "rule": rule,
-                    "input_size_mb": sum(input_sizes.values()),
-                    "runtime_s": runtime,
-                    "run": os.path.basename(run_dir),
-                }
-            )
+    df, omitted = collect_stained_glass_input_size_rows(
+        path,
+        single_run=single_run,
+        modes=(input_mode,),
+    )
+    if df.empty:
+        raise ValueError(
+            "No benchmark rows found with required fields (s, input_size_mb). "
+            f"Looked under training runs at: {path}"
+        )
 
-    df = pd.DataFrame(rows)
-    rules = sorted(df["rule"].unique())
+    mode_df = df[df["mode"] == input_mode].copy()
+    mode_df = mode_df.dropna(subset=["rule", "input_size_mb", "runtime_s"])
+    if mode_df.empty:
+        raise ValueError(
+            "No usable benchmark rows after parsing rule/runtime/input size values. "
+            f"Looked under training runs at: {path}"
+        )
+
+    rules = sorted(mode_df["rule"].unique())
     cols = 3
     plot_rows = (len(rules) + cols - 1) // cols
     fig, axes = plt.subplots(
@@ -472,30 +769,42 @@ def plot_direct_input_correlation(
 
     summary = {method: {} for method in corr_methods}
     for ax, rule in zip(axes.flat, rules):
-        rule_df = df[df["rule"] == rule]
+        rule_df = mode_df[mode_df["rule"] == rule]
         sns.scatterplot(data=rule_df, x="input_size_mb", y="runtime_s", ax=ax, s=35)
         correlations = calculate_correlations(rule_df, corr_methods)
         for method, corr in correlations.items():
             summary[method][rule] = corr
-        corr_text = format_correlation_title(correlations)
-        ax.set_title(f"{rule}\n{corr_text}, n={len(rule_df)}")
-        ax.set_xlabel("Direct input size [MB]")
+        corr_text = format_correlation_title(correlations, threshold=corr_threshold)
+        omitted_count = omitted[input_mode].get(rule, 0)
+        ax.set_title(f"{rule}\n{corr_text}, n={len(rule_df)}, omitted={omitted_count}")
+        ax.set_xlabel(input_size_axis_label(input_mode))
         ax.set_ylabel("Runtime [s]")
         ax.grid(True, color="lightgray", linestyle="--", linewidth=0.5)
 
     for ax in axes.flat[len(rules) :]:
         ax.axis("off")
 
-    suffix = "single_run_direct_total" if single_run else "all_runs_direct_total"
+    suffix = (
+        f"single_run_direct_{input_mode}"
+        if single_run
+        else f"all_runs_direct_{input_mode}"
+    )
+    source_label = source_label_from_path(path)
     title_scope = (
         os.path.basename(run_dirs[0])
         if single_run
         else f"{len(run_dirs)} training runs"
     )
-    fig.suptitle(f"{workflow}: direct input size vs runtime\n{title_scope}", y=1.02)
+    fig.suptitle(
+        f"{workflow}: {input_size_descriptor(input_mode)} vs runtime\n{title_scope}",
+        y=1.02,
+    )
     fig.tight_layout()
     plt.savefig(
-        os.path.join(SCRIPT_DIR, f"input_size_correlation_{workflow}_{suffix}.png"),
+        os.path.join(
+            SCRIPT_DIR,
+            f"input_size_correlation_{workflow}_{source_label}_{suffix}.png",
+        ),
         dpi=300,
         bbox_inches="tight",
     )
@@ -510,14 +819,20 @@ def plot_single_training_run_direct_input_correlation(path, workflow="stained-gl
 def plot_input_size_correlations(
     training_dir,
     workflow="stained-glass",
-    modes=("total", "primary", "ancestor"),
+    modes=("total",),
     single_run=False,
     corr_methods=("pearson",),
     corr_threshold=0.8,
 ):
     run_count = len(resolve_training_runs(training_dir))
     scope = "single_run" if run_count == 1 else "all_runs"
-    df, omitted = collect_stained_glass_input_size_rows(training_dir)
+    source_label = source_label_from_path(training_dir)
+    df, omitted = collect_stained_glass_input_size_rows(
+        training_dir,
+        single_run=single_run,
+        modes=modes,
+    )
+
     for mode in modes:
         mode_df = df[df["mode"] == mode].copy()
         if mode_df.empty:
@@ -537,12 +852,12 @@ def plot_input_size_correlations(
             correlations = calculate_correlations(rule_df, corr_methods)
             for method, corr in correlations.items():
                 summary[method][rule] = corr
-            corr_text = format_correlation_title(correlations)
+            corr_text = format_correlation_title(correlations, threshold=corr_threshold)
             omitted_count = omitted[mode].get(rule, 0)
             ax.set_title(
                 f"{rule}\n{corr_text}, n={len(rule_df)}, omitted={omitted_count}"
             )
-            ax.set_xlabel("Input size [MB]")
+            ax.set_xlabel(input_size_axis_label(mode))
             ax.set_ylabel("Runtime [s]")
             ax.grid(True, color="lightgray", linestyle="--", linewidth=0.5)
 
@@ -550,13 +865,14 @@ def plot_input_size_correlations(
             ax.axis("off")
 
         fig.suptitle(
-            f"{workflow}: runtime correlation with {mode} input size ({run_count} run{'s' if run_count != 1 else ''})",
+            f"{workflow}: runtime correlation with {input_size_descriptor(mode)} ({run_count} run{'s' if run_count != 1 else ''})",
             y=1.01,
         )
         fig.tight_layout()
         plt.savefig(
             os.path.join(
-                SCRIPT_DIR, f"input_size_correlation_{workflow}_{scope}_{mode}.png"
+                SCRIPT_DIR,
+                f"input_size_correlation_{workflow}_{source_label}_{scope}_{mode}.png",
             ),
             dpi=300,
             bbox_inches="tight",
@@ -567,7 +883,7 @@ def plot_input_size_correlations(
 
 
 def _get_mode_df(training_dir, mode):
-    df, _ = collect_stained_glass_input_size_rows(training_dir)
+    df, _ = collect_stained_glass_input_size_rows(training_dir, modes=(mode,))
     mode_df = df[df["mode"] == mode].copy()
     if mode_df.empty:
         raise ValueError(f"No rows found for mode '{mode}' in {training_dir}")
@@ -625,7 +941,7 @@ def plot_prediction_with_uncertainty_band(
         alpha=0.2,
         label="95% interval",
     )
-    plt.xlabel("Input size [MB]")
+    plt.xlabel(input_size_axis_label(mode))
     plt.ylabel("Runtime [s]")
     plt.title(f"{workflow} | {rule_name} | Bayesian uncertainty ({mode})")
     plt.legend()
@@ -835,7 +1151,7 @@ def plot_posterior_with_two_gaussian_priors(
             label="95% interval (strong prior)",
         )
 
-        plt.xlabel("Input size [MB]")
+        plt.xlabel(input_size_axis_label(mode))
         plt.ylabel("Runtime [s]")
         plt.title(
             f"{workflow} | {rule_name} | Bayesian posterior with two priors ({mode})"
@@ -1062,19 +1378,14 @@ def read_files(log_dir, prediction_path, workflow, median_rules):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--input-correlation",
+        "--input-data",
         help="Path to a single run snakemake.log/run directory or to a training-runs directory",
     )
     parser.add_argument(
         "--bayesian-plots",
         help="Path to training runs directory for Bayesian plot set (uncertainty, prediction error, coefficients)",
     )
-    parser.add_argument(
-        "--bayesian-mode",
-        choices=["total", "primary", "ancestor"],
-        default="total",
-        help="input-size mode used for Bayesian plot set",
-    )
+
     parser.add_argument(
         "--bayesian-rule",
         help="optional rule name for uncertainty/prediction-error plots; defaults to rule with most samples",
@@ -1096,12 +1407,7 @@ def main():
         "--bayesian-percentile-visuals",
         help="Path to bayesian_percentiles_*.json for calibration and sharpness/error visuals",
     )
-    parser.add_argument(
-        "--input-mode",
-        choices=["total", "primary", "ancestor"],
-        default="total",
-        help="input size type to plot",
-    )
+
     parser.add_argument(
         "--corr-method",
         choices=["pearson", "spearman", "both"],
@@ -1121,7 +1427,7 @@ def main():
         plot_posterior_with_two_gaussian_priors(
             args.bayesian_two_priors,
             args.workflow,
-            mode=args.bayesian_mode,
+            mode=SOU_INPUT_MODE,
             rule=args.bayesian_rule,
             all_rules=args.bayesian_two_priors_all_rules,
         )
@@ -1131,7 +1437,7 @@ def main():
         export_bayesian_percentile_predictions(
             args.bayesian_export_percentiles,
             args.workflow,
-            mode=args.bayesian_mode,
+            mode=SOU_INPUT_MODE,
         )
         return
 
@@ -1146,37 +1452,28 @@ def main():
         generate_bayesian_plots(
             args.bayesian_plots,
             args.workflow,
-            mode=args.bayesian_mode,
+            mode=SOU_INPUT_MODE,
             rule=args.bayesian_rule,
         )
         return
 
-    if args.input_correlation:
-        single_run = os.path.isfile(args.input_correlation) or os.path.isdir(
-            os.path.join(args.input_correlation, "benchmarks")
+    if args.input_data:
+        single_run = os.path.isfile(args.input_data) or os.path.isdir(
+            os.path.join(args.input_data, "benchmarks")
         )
         corr_methods = (
             ("pearson", "spearman")
             if args.corr_method == "both"
             else (args.corr_method,)
         )
-        if args.input_mode == "total":
-            plot_direct_input_correlation(
-                args.input_correlation,
-                args.workflow,
-                single_run=single_run,
-                corr_methods=corr_methods,
-                corr_threshold=args.corr_threshold,
-            )
-        else:
-            plot_input_size_correlations(
-                args.input_correlation,
-                args.workflow,
-                modes=[args.input_mode],
-                single_run=single_run,
-                corr_methods=corr_methods,
-                corr_threshold=args.corr_threshold,
-            )
+        plot_direct_input_correlation(
+            args.input_data,
+            args.workflow,
+            single_run=single_run,
+            input_mode=SOU_INPUT_MODE,
+            corr_methods=corr_methods,
+            corr_threshold=args.corr_threshold,
+        )
         return
 
     rna_dir = "../../experimental-data/rna-seq-star-deseq2/experiments"

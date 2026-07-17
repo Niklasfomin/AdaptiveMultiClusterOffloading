@@ -389,7 +389,7 @@ class Scheduler:
         self, offloading_strategy: OffloadingStrategy, deadline: float
     ):
         if offloading_strategy == OffloadingStrategy.LONGEST_JOB_FIRST:
-            sort_deferred_func = lambda j: self.predictions[j]
+            if offloading_strategy == Offloa
         elif offloading_strategy == OffloadingStrategy.SMALLEST_INPUT_SIZE_FIRST:
             sort_deferred_func = lambda j: get_total_input_size(
                 self.dag.get_initial_input_files_ancestors(j),
