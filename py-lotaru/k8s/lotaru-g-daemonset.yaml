@@ -13,6 +13,8 @@ spec:
       labels:
         app: lotaru-g-benchmark
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       restartPolicy: Always
       containers:
         - name: lotaru-g
@@ -22,7 +24,7 @@ spec:
             - /bin/bash
             - -lc
           args:
-            - lotaru-g.sh --contention && echo "benchmark finished on ${NODE_NAME}" && sleep infinity
+            - lotaru-g.sh && echo "benchmark finished on ${NODE_NAME}" && sleep infinity
           env:
             - name: NODE_NAME
               valueFrom:

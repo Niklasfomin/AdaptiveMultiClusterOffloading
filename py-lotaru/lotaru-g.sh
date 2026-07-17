@@ -2,7 +2,13 @@
 set -euo pipefail
 
 WITH_CONTENTION=false
+WITH_FULL_SCORES=false
 CONTENTION_RUNTIME=${CONTENTION_RUNTIME:-45}
+NET_HOST=${NET_HOST:-}
+NET_HOST_MAP=${NET_HOST_MAP:-}
+NET_PROBE_DURATION=${NET_PROBE_DURATION:-5}
+NET_CONNECT_TIMEOUT=${NET_CONNECT_TIMEOUT:-5}
+IPERF3_SERVER_PID=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -10,13 +16,28 @@ while [[ $# -gt 0 ]]; do
       WITH_CONTENTION=true
       shift
       ;;
+    --scores-full)
+      WITH_FULL_SCORES=true
+      shift
+      ;;
     -h|--help)
-      echo "Usage: $0 [--contention]"
+      cat <<'EOF'
+Usage: lotaru-g.sh [--contention] [--scores-full]
+
+Options:
+  --contention       Run additional contended benchmark and emit contention metrics.
+  --scores-full      Also emit memory_score and network_score_mbps (iperf3 probe).
+
+Environment for --scores-full:
+  NET_HOST_MAP          comma-separated node=peer-ip mapping supplied by SOU
+  NET_PROBE_DURATION    seconds for iperf3 probe (default: 5)
+  NET_CONNECT_TIMEOUT   connection timeout seconds (default: 5)
+EOF
       exit 0
       ;;
     *)
       echo "Unknown option: $1" >&2
-      echo "Usage: $0 [--contention]" >&2
+      echo "Usage: $0 [--contention] [--scores-full]" >&2
       exit 1
       ;;
   esac
@@ -28,6 +49,15 @@ for cmd in sysbench fio python3 awk hostname nproc; do
     exit 1
   fi
 done
+
+if [[ "$WITH_FULL_SCORES" == true ]]; then
+  for cmd in iperf3 timeout; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      echo "Missing required command for --scores-full: $cmd" >&2
+      exit 1
+    fi
+  done
+fi
 
 HOST="${NODE_NAME:-$(hostname -s)}"
 OUT="${OUT:-.}"
@@ -51,6 +81,12 @@ cleanup() {
     done < "$CONTENT_PID_FILE"
     rm -f "$CONTENT_PID_FILE"
   fi
+
+  if [[ -n "$IPERF3_SERVER_PID" ]]; then
+    kill "$IPERF3_SERVER_PID" >/dev/null 2>&1 || true
+    wait "$IPERF3_SERVER_PID" 2>/dev/null || true
+  fi
+
   rm -f "$FIO_FILE" "$CONTENTION_FILE"
 }
 trap cleanup EXIT
@@ -106,6 +142,68 @@ EOF
   printf '%s %s %s %s %s\n' "$cpu_score" "$ram_score" "$read_iops" "$write_iops" "$io_score"
 }
 
+select_net_host() {
+  local entry node peer
+  IFS=',' read -ra entries <<< "$NET_HOST_MAP"
+  for entry in "${entries[@]}"; do
+    node=${entry%%=*}
+    peer=${entry#*=}
+    if [[ "$node" == "$HOST" ]]; then
+      NET_HOST=$peer
+      return 0
+    fi
+  done
+  echo "No network peer configured for node ${HOST}" >&2
+  return 1
+}
+
+start_iperf3_server() {
+  if timeout 1s iperf3 -c 127.0.0.1 -t 1 >/dev/null 2>&1; then
+    return 0
+  fi
+
+  iperf3 -s >/dev/null 2>&1 &
+  IPERF3_SERVER_PID=$!
+  sleep 1
+
+  if ! kill -0 "$IPERF3_SERVER_PID" >/dev/null 2>&1; then
+    echo "Using existing iperf3 server on port 5201" >&2
+    IPERF3_SERVER_PID=""
+  fi
+}
+
+check_net_reachable() {
+  if ! timeout "${NET_CONNECT_TIMEOUT}s" iperf3 -c "$NET_HOST" -t 1 >/dev/null 2>&1; then
+    echo "Cannot reach iperf3 server at ${NET_HOST}:5201" >&2
+    return 1
+  fi
+}
+
+probe_net_max_mbps() {
+  check_net_reachable || return 1
+
+  local probe_timeout=$((NET_PROBE_DURATION + NET_CONNECT_TIMEOUT + 2))
+  local probe_output
+  probe_output=$(timeout "${probe_timeout}s" iperf3 -c "$NET_HOST" -t "$NET_PROBE_DURATION" -J 2>/dev/null || true)
+  if [[ -z "$probe_output" ]]; then
+    echo "iperf3 probe failed for host ${NET_HOST}" >&2
+    return 1
+  fi
+
+  python3 -c 'import json, sys
+try:
+    data = json.load(sys.stdin)
+    end = data.get("end", {})
+    bps = (
+        end.get("sum_received", {}).get("bits_per_second")
+        or end.get("sum_sent", {}).get("bits_per_second")
+        or 0
+    )
+    print(round(max(0, bps / 1_000_000), 3))
+except Exception:
+    raise SystemExit("Could not parse network score from iperf3 JSON output")' <<< "$probe_output"
+}
+
 start_contention() {
   : > "$CONTENT_PID_FILE"
 
@@ -127,7 +225,21 @@ start_contention() {
   sleep 2
 }
 
+if [[ "$WITH_FULL_SCORES" == true ]]; then
+  select_net_host
+  start_iperf3_server
+fi
+
 read -r CPU_SCORE RAM_SCORE READ_IOPS WRITE_IOPS IO_SCORE < <(run_benchmark "$FIO_FILE")
+
+RESOURCE_JSON=""
+if [[ "$WITH_FULL_SCORES" == true ]]; then
+  NETWORK_SCORE_MBPS=$(probe_net_max_mbps)
+  RESOURCE_JSON=",
+  \"memory_score\": $RAM_SCORE,
+  \"network_score_mbps\": $NETWORK_SCORE_MBPS,
+  \"network_target_host\": \"$NET_HOST\""
+fi
 
 CONTENTION_SCORE=""
 CONTENTION_JSON=""
@@ -182,7 +294,7 @@ cat > "$OUT/$HOST.rich.json" <<EOF
   "ram_score": $RAM_SCORE,
   "read_iops": $READ_IOPS,
   "write_iops": $WRITE_IOPS,
-  "io_score": $IO_SCORE$CONTENTION_JSON,
+  "io_score": $IO_SCORE$RESOURCE_JSON$CONTENTION_JSON,
   "profile_time_s": $((STOP-START))
 }
 EOF

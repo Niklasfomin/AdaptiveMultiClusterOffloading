@@ -5,6 +5,7 @@ RUN apk add --no-cache \
     coreutils \
     fio \
     gawk \
+    iperf3 \
     python3 \
     sysbench
 

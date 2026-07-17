@@ -15,6 +15,8 @@ spec:
       labels:
         app: lotaru-g-benchmark
     spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       restartPolicy: Always
       containers:
         - name: lotaru-g
