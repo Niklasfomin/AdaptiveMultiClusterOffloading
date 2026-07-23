@@ -109,6 +109,20 @@ class ExecutorSettings(ExecutorSettingsBase):
             "(<pvc-name>:<shared-workdir-path>)."
         },
     )
+    run_as_user: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Numeric UID for containers using a shared workdir. "
+            "Defaults to the submitting process UID."
+        },
+    )
+    run_as_group: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": "Numeric GID for containers using a shared workdir. "
+            "Defaults to the submitting process GID."
+        },
+    )
     gcp_app_creds_file: Optional[str] = field(
         default=None,
         metadata={
@@ -185,6 +199,14 @@ class Executor(RemoteExecutor):
         self.shared_workdir = getattr(
             self.workflow.executor_settings, "shared_workdir", None
         )
+        configured_uid = getattr(
+            self.workflow.executor_settings, "run_as_user", None
+        )
+        configured_gid = getattr(
+            self.workflow.executor_settings, "run_as_group", None
+        )
+        self.run_as_user = os.getuid() if configured_uid is None else configured_uid
+        self.run_as_group = os.getgid() if configured_gid is None else configured_gid
 
         # keep track of submitted jobs to check when pods become running
         self.pending_jobs = set()
@@ -196,6 +218,8 @@ class Executor(RemoteExecutor):
         self.logger.info(f"Using {self.container_image} for Kubernetes jobs.")
 
     def run_job(self, job: JobExecutorInterface):
+        self._validate_shared_wait_for_files(job)
+
         # Implement here how to run a job.
         # You can access the job's resources, etc.
         # via the job object.
@@ -275,11 +299,11 @@ class Executor(RemoteExecutor):
         )
         if self.shared_workdir and not self.privileged:
             container.security_context = kubernetes.client.V1SecurityContext(
-                run_as_user=os.getuid(),
-                run_as_group=os.getgid(),
+                run_as_user=self.run_as_user,
+                run_as_group=self.run_as_group,
             )
             pod_spec.security_context = kubernetes.client.V1PodSecurityContext(
-                fs_group=os.getgid()
+                fs_group=self.run_as_group
             )
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
@@ -404,6 +428,10 @@ class Executor(RemoteExecutor):
                     kubernetes.client.V1EnvVar(name="LOGNAME", value="snakemake"),
                     kubernetes.client.V1EnvVar(name="USER", value="snakemake"),
                     kubernetes.client.V1EnvVar(name="HOME", value="/tmp"),
+                    kubernetes.client.V1EnvVar(name="SPARK_USER", value="snakemake"),
+                    kubernetes.client.V1EnvVar(
+                        name="HADOOP_USER_NAME", value="snakemake"
+                    ),
                 ]
             )
 
@@ -500,6 +528,33 @@ class Executor(RemoteExecutor):
             self.logger.info("\nUnreserved resources after job submission:")
             self.report_k8s_resource_utilization()
 
+    def _validate_shared_wait_for_files(self, job: JobExecutorInterface):
+        """Reject host-local dependencies that worker pods cannot access."""
+        if not self.shared_workdir:
+            return
+
+        mount_paths = [pvc.path.absolute() for pvc in self.persistent_volumes]
+        inaccessible_paths = []
+        for path_value in job.get_wait_for_files():
+            path = Path(path_value)
+            if not path.is_absolute():
+                continue
+            if not any(path.is_relative_to(mount_path) for mount_path in mount_paths):
+                inaccessible_paths.append(path)
+
+        if inaccessible_paths:
+            shared_cache = Path(self.shared_workdir) / ".snakemake" / "xdg-cache"
+            paths = "\n".join(f"  - {path}" for path in inaccessible_paths)
+            raise WorkflowError(
+                "Kubernetes worker pods cannot access required files outside the "
+                "configured persistent-volume mount paths:\n"
+                f"{paths}\n"
+                "Place Snakemake's source cache on the shared filesystem before "
+                "starting the controller, for example:\n"
+                f"  export XDG_CACHE_HOME={shared_cache}\n"
+                "Alternatively, mount a PVC that covers every listed path."
+            )
+
     async def check_active_jobs(
         self, active_jobs: List[SubmittedJobInfo]
     ) -> AsyncGenerator[SubmittedJobInfo, None]:
@@ -565,13 +620,18 @@ class Executor(RemoteExecutor):
                         self.logger.info(f"Started jobid: {j.job.jobid}")
                         self.pending_jobs.remove(j.external_jobid)
 
-                    # Pending jobs don't have container statuses yet
-                    if pod.status.phase != "Pending":
-                        snakemake_container = [
+                    # Container statuses can be absent briefly even after the pod has
+                    # left Pending (for example while kubelet status catches up).
+                    container_statuses = pod.status.container_statuses or []
+                    snakemake_container = next(
+                        (
                             container
-                            for container in pod.status.container_statuses
+                            for container in container_statuses
                             if container.name == "snakemake"
-                        ][0]
+                        ),
+                        None,
+                    )
+                    if snakemake_container is not None:
                         snakemake_container_exit_code = (
                             snakemake_container.state.terminated.exit_code
                             if snakemake_container.state.terminated is not None
@@ -587,8 +647,7 @@ class Executor(RemoteExecutor):
                         f"kubectl describe job {j.external_jobid}"
                     )
 
-                    if pod_name is not None:
-                        assert snakemake_container is not None
+                    if pod_name is not None and snakemake_container is not None:
                         kube_log = self.log_path / f"{j.external_jobid}.log"
                         with open(kube_log, "w") as f:
 
@@ -619,6 +678,22 @@ class Executor(RemoteExecutor):
                 elif (res.status.succeeded and res.status.succeeded >= 1) or (
                     snakemake_container_exit_code == 0
                 ):
+                    # Report output file sizes written to storage provider
+                    output_sizes= {}
+                    for output in j.job.output:
+                        path = Path(str(output))
+                        try:
+                            if path.is_file():
+                                output_sizes[str(output)] = path.stat().st_size
+                        except Exception as e:
+                            self.logger.info(f"Could not get size for output {output}: {e}")
+
+                    output_size_mb = sum(output_sizes.values()) / (1024 **2)
+                    self.logger.info( f"OUTPUT_SIZE jobid={j.job.jobid} "
+                       f"rule={j.job.name} "
+                       f"output_size_mb={output_size_mb:.6f} "
+                       f"outputs={output_sizes}"
+                   )
                     # finished
                     self.logger.info(f"Job {j.external_jobid} succeeded.")
                     self.report_job_success(j)

@@ -1,2 +1,10 @@
 .csv
 .png
+.venv
+.agents
+.venv-snakemake-9.6
+experimental-data
+
+.venv/
+__pycache__/
+*.py[cod]

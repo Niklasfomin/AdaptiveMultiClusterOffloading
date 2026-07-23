@@ -27,3 +27,4 @@ clusters:
       vcpu_hour: 0.04656
       mem_gb_hour: 0.00511
       disk_gb_hour: 0.000132
+      net_gb_hour: 0.000132

@@ -20,6 +20,7 @@ from sou.helpers import (
 from sou.predictor import Predictor
 from sou.snakemake_dag import SnakemakeDag
 from sou.snakemake_dryrun import SnakemakeDryrun
+from sou.snakemake_log import SnakemakeLog
 
 logger = logging.getLogger("sou")
 
@@ -97,6 +98,14 @@ class OffloadingStrategy(Enum):
     LONGEST_JOB_FIRST = "Longest job first"
     SMALLEST_INPUT_SIZE_FIRST = "Smallest input size first"
 
+class UncertaintyAwareOffloadingStrategy(Enum):
+    NONE = "No offloading"
+    PRIMARY_BURST = "Fully load Primary cluster"
+    LONGEST_JOB_FIRST = "Longest job first"
+    CRITICAL_PATH_FIRST = "Select progress critical job first"
+    SMALLEST_INPUT_SIZE_FIRST = "Data centric smallest input size first"
+    LARGEST_INPUT_SIZE_FIRST = "Data centric largest input size first"
+    COST_PERFORMANCE_IMPROVEMENT_FIRST = "Selection based on biggest Runtime / cost ratio improvement"
 
 class ProfilingStrategy(Enum):
     NONE = "No profiling"
@@ -130,6 +139,7 @@ class Scheduler:
         primary_cluster: Cluster,
         secondary_cluster: Cluster,
         prices: dict,
+        snakemake_log: SnakemakeLog,
         parallel_jobs: int = sys.maxsize,
     ):
         self.dag = dag
@@ -139,6 +149,7 @@ class Scheduler:
         self.secondary_cluster = secondary_cluster
         self.max_parallel_jobs = parallel_jobs
         self.prices = prices  # in $, secondary cluster
+        self.snakemake_log = snakemake_log
         self.node_benchmark_scores: dict[str, dict[str, float]] = {}
         self.node_runtime_factors: dict[str, float] = {}
         self.local_benchmark_score: dict[str, float] = {}
@@ -409,6 +420,7 @@ class Scheduler:
         )
         return self.predictions[jobid]
 
+    # TODO: Add/change strategies here
     def predict_workflow_runtime(
         self,
         offloading_strategy: OffloadingStrategy = OffloadingStrategy.NONE,
@@ -437,6 +449,8 @@ class Scheduler:
             jobid: self.dag.get_rule_by_jobid(jobid) for jobid in offloaded_jobs
         }
         return latest_runtime_estimate, offloaded_jobs
+
+
 
     def simulate_approaching_deadline(
         self,
@@ -663,33 +677,71 @@ class Scheduler:
         return predictions
 
     # TODO: It might still operate on base runtimes and not on extrapolated runtimes, which would be more accurate
+    # Refactored to represent GKE Autopilot pricing model, with one-demand pricing and on-demand pod's.
     def _calculate_cost(
         self,
         runtime: float,
         requested_cores: float,
         requested_mem_mb: float,
         requested_disk_mb: float,
+        transferred_output_mb: float,
     ):
         return runtime * (
             (self.prices.get("vcpu_hour") / 3600) * requested_cores
             + (self.prices.get("mem_gb_hour") / 3600) * (requested_mem_mb / 1000)
             + (self.prices.get("disk_gb_hour") / 3600) * (requested_disk_mb / 1000)
+            + (self.prices.get("net_gb_hour") / 3600) * (transferred_output_mb / 1000)
         )
+    # def _calculate_cost(
+    #     self,
+    #     runtime: float,
+    #     requested_cores: float,
+    #     requested_mem_mb: float,
+    #     requested_disk_mb: float,
+    # ):
+    #     return runtime * (
+    #         (self.prices.get("vcpu_hour") / 3600) * requested_cores
+    #         + (self.prices.get("mem_gb_hour") / 3600) * (requested_mem_mb / 1000)
+    #         + (self.prices.get("disk_gb_hour") / 3600) * (requested_disk_mb / 1000)
+    #     )
 
+    # Modified to match GKE Autopilot pricing model, with one-demand pricing and on-demand pod's.
     def predict_offloading_cost(self, offloaded_jobs: set[int]):
         total_cost = 0
+        workflow_cost = 0
+        primary_cluster_operational_cost = 0
         for jobid in offloaded_jobs:
             runtime = self.last_offloaded_effective_runtime_per_job.get(jobid, self.predictions[jobid])
-            # defaults for resources are taken from AWS Fargate: 1 vCPU, 2 GB RAM, 20 GB disk
-            total_cost += self._calculate_cost(
+            workflow_cost += self._calculate_cost(
                 runtime if runtime is not None else 0.0,
 
                 self.dryrun.get_requested_resources(jobid).get("threads", 1),
                 self.dryrun.get_requested_resources(jobid).get("mem_mb", 2000),
                 self.dryrun.get_requested_resources(jobid).get("disk_mb", 20000),
+                # TODO: Insert helper method here that reads from the logs the output f
+                transferred_output_mb=(
+                    self.snakemake_log.get_output_size_mb_by_jobid(jobid) or 0.0
+                )
+
             )
+            total_cost += workflow_cost + primary_cluster_operational_cost
+        logger.info(f"Workflow cost: ${workflow_cost}")
         logger.info(f"Total cost of offloading: ${total_cost}")
-        return total_cost
+        return workflow_cost,total_cost
+    # def predict_offloading_cost(self, offloaded_jobs: set[int]):
+    #     total_cost = 0
+    #     for jobid in offloaded_jobs:
+    #         runtime = self.last_offloaded_effective_runtime_per_job.get(jobid, self.predictions[jobid])
+    #         # defaults for resources are taken from AWS Fargate: 1 vCPU, 2 GB RAM, 20 GB disk
+    #         total_cost += self._calculate_cost(
+    #             runtime if runtime is not None else 0.0,
+
+    #             self.dryrun.get_requested_resources(jobid).get("threads", 1),
+    #             self.dryrun.get_requested_resources(jobid).get("mem_mb", 2000),
+    #             self.dryrun.get_requested_resources(jobid).get("disk_mb", 20000),
+    #         )
+    #     logger.info(f"Total cost of offloading: ${total_cost}")
+    #     return total_cost
 
 
 def get_total_input_size(input_files, input_file_sizes):
@@ -729,17 +781,19 @@ def main(
     profiling_environment: ProfilingEnvironment = ProfilingEnvironment.NONE,
     corr_threshold: float = 0.8,
     benchmark_csv: str | None = None,
+    decision_model: str = "linear",
 ):
     setup_logging()
 
     dryrun = SnakemakeDryrun()
     dag = SnakemakeDag()
-    predictor = Predictor(runs_dir, corr_threshold)
+    snakemake_log = SnakemakeLog("snakemake.log")
+    predictor = Predictor(runs_dir, corr_threshold, decision_model)
     cluster_config = get_config().get("clusters")
     primary_cluster, secondary_cluster = create_clusters(cluster_config)
     prices = cluster_config.get("secondary", {}).get("prices", {})
     scheduler = Scheduler(
-        dag, dryrun, predictor, primary_cluster, secondary_cluster, prices
+        dag, dryrun, predictor, primary_cluster, secondary_cluster, prices, snakemake_log
     )
 
     if profiling_environment == ProfilingEnvironment.REMOTE:
@@ -775,6 +829,7 @@ def run_main_safely(
     profiling_environment: ProfilingEnvironment,
     corr_threshold: float,
     benchmark_csv: str | None = None,
+    decision_model: str = "linear",
 ):
     try:
         return main(
@@ -784,6 +839,7 @@ def run_main_safely(
             profiling_environment,
             corr_threshold,
             benchmark_csv,
+            decision_model,
         )
     except Exception as e:
         logger.exception("An error occurred during workflow prediction:")

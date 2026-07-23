@@ -28,6 +28,7 @@ class SnakemakeLog:
         self.log_file_path = Path(log_file_path).resolve()
         logger.info(f"Reading snakemake log '{self.log_file_path}'")
         self.log_text = self._read_log()
+        self.output_size_mb_by_jobid = {}
         self.jobs_to_files, self.benchmark_to_wall_time, self.benchmark_to_job = (
             self._parse_log()
         )
@@ -46,6 +47,7 @@ class SnakemakeLog:
     def _parse_log(self):
         job_to_files = {}
         current_job_files = {}
+        job_output_files = {}
 
         job_submission_times = {}
         job_start_times = {}
@@ -128,6 +130,14 @@ class SnakemakeLog:
                     logger.debug(
                         f"Found job {jobid} with associated files: {current_job_files}"
                     )
+
+            elif line.startswith("OUTPUT_SIZE "):
+                match = re.search(
+                    r"OUTPUT_SIZE jobid=(\d+).*?output_size_mb=([0-9.]+)", line
+                )
+                if match:
+                    jobid = match.group(1)
+                    self.output_size_mb_by_jobid[jobid] = float(match.group(2))
 
             elif line.startswith("Started jobid:"):
                 match = re.search(r"Started jobid: (\d+)", line)
@@ -235,3 +245,9 @@ class SnakemakeLog:
         if not jobid:
             logger.warning(f"Found no jobid for benchmark file {benchmark_file}")
         return jobid
+
+    def get_output_size_mb_by_jobid(self, jobid):
+        output_size_mb = self.output_size_mb_by_jobid.get(str(jobid))
+        if output_size_mb is None:
+            logger.warning(f"Found no output size for jobid {jobid}")
+        return output_size_mb

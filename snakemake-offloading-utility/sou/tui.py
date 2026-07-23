@@ -886,6 +886,12 @@ def run_cli(argv: list[str]):
     parser.add_argument("--deadline-minutes", type=float)
     parser.add_argument("--corr-threshold", type=float, default=0.8)
     parser.add_argument(
+        "--decision-model",
+        choices=["linear", "bayesian", "median", "min", "max", "p90"],
+        default="linear",
+        help="prediction model or per-rule constant baseline used for scheduling",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
@@ -1076,6 +1082,7 @@ def run_cli(argv: list[str]):
         args.profiling_environment,
         args.corr_threshold,
         benchmark_csv,
+        args.decision_model,
     )
     if not result:
         return 1
